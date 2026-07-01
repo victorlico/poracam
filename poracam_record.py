@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-poracam_record.py — Poracam v0.5
+poracam_record.py — Poracam v0.6
 
-Novidades da v0.5:
+Novidades da v0.6:
 - Procura armazenamento externo com PORACAM/config.txt em /media/*/* e /mnt/*.
 - Se encontrar config externo, usa esse config e salva em PORACAM/media quando media_dir não estiver definido.
 - Mantém fallback local.
@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 PROJECT_NAME = "poracam"
-PROJECT_VERSION = "0.5"
+PROJECT_VERSION = "0.6"
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "duration": 60,
@@ -44,6 +44,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "max_storage_percent": 95.0,
     "prefer_external_storage": True,
     "allow_local_fallback": True,
+    "camera_conflict_policy": "stop_known_processes",
+    "camera_startup_check_s": 1.0,
+    "camera_stop_timeout_s": 5.0,
 }
 
 CONFIG_KEY_ALIASES = {
@@ -59,6 +62,9 @@ CONFIG_KEY_ALIASES = {
     "max_storage_percent": "max_storage_percent", "storage_max_percent": "max_storage_percent",
     "prefer_external_storage": "prefer_external_storage",
     "allow_local_fallback": "allow_local_fallback",
+    "camera_conflict_policy": "camera_conflict_policy",
+    "camera_startup_check_s": "camera_startup_check_s",
+    "camera_stop_timeout_s": "camera_stop_timeout_s",
 }
 
 
@@ -100,11 +106,11 @@ def parse_value(key: str, raw_value: str) -> Any:
     value = raw_value.strip()
     if key in ("duration", "cycle_period_s", "width", "height", "fps", "bitrate"):
         return int(value)
-    if key in ("start_delay", "extra_timeout", "max_storage_percent"):
+    if key in ("start_delay", "extra_timeout", "max_storage_percent", "camera_startup_check_s", "camera_stop_timeout_s"):
         return float(value)
     if key in ("keep_h264", "delete_h264_after_mp4", "prefer_external_storage", "allow_local_fallback"):
         return parse_bool(value)
-    if key == "run_mode":
+    if key in ("run_mode", "camera_conflict_policy"):
         return value.strip().lower()
     return value
 
@@ -226,6 +232,9 @@ def merge_config(args: argparse.Namespace) -> Tuple[Dict[str, Any], Optional[str
         "max_storage_percent": args.max_storage_percent,
         "prefer_external_storage": False if args.ignore_external_storage else None,
         "allow_local_fallback": args.allow_local_fallback,
+        "camera_conflict_policy": args.camera_conflict_policy,
+        "camera_startup_check_s": args.camera_startup_check_s,
+        "camera_stop_timeout_s": args.camera_stop_timeout_s,
     }
     for key, value in cli_overrides.items():
         if value is not None:
@@ -279,6 +288,108 @@ def stop_process(proc: subprocess.Popen, name: str, log_file: Path, timeout: flo
         proc.wait(timeout=timeout)
     finally:
         close_proc_log(proc)
+
+
+KNOWN_CAMERA_PROCESS_NAMES = ["raspimjpeg", "motion", "raspivid", "raspistill"]
+
+
+def list_processes_by_name(names: List[str]) -> List[Dict[str, Any]]:
+    """Lista processos que podem estar usando a câmera."""
+    current_pid = os.getpid()
+    result = subprocess.run(
+        ["ps", "-eo", "pid=,comm=,args="],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    matches: List[Dict[str, Any]] = []
+    if result.returncode != 0:
+        return matches
+    for line in result.stdout.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) < 2:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        if pid == current_pid:
+            continue
+        comm = parts[1]
+        args = parts[2] if len(parts) >= 3 else ""
+        for name in names:
+            if comm == name or f"/{name}" in args or name in args.split():
+                matches.append({"pid": pid, "comm": comm, "args": args, "matched_name": name})
+                break
+    return matches
+
+
+def stop_pid(pid: int, log_file: Path, timeout: float) -> bool:
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        append_log(log_file, f"Permission denied when trying to stop pid={pid}")
+        return False
+
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.1)
+
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        append_log(log_file, f"Permission denied when trying to kill pid={pid}")
+        return False
+
+    time.sleep(0.2)
+    try:
+        os.kill(pid, 0)
+        return False
+    except ProcessLookupError:
+        return True
+
+
+def handle_camera_conflicts(config: Dict[str, Any], log_file: Path) -> Dict[str, Any]:
+    """Aplica política de conflito de câmera antes de iniciar a gravação."""
+    policy = str(config["camera_conflict_policy"]).lower()
+    timeout = float(config["camera_stop_timeout_s"])
+    before = list_processes_by_name(KNOWN_CAMERA_PROCESS_NAMES)
+    actions: List[Dict[str, Any]] = []
+
+    if before:
+        append_log(log_file, f"Camera conflict candidates found: {before}")
+    else:
+        append_log(log_file, "No known camera conflict process found")
+
+    if policy == "ignore":
+        return {"policy": policy, "known_process_names": KNOWN_CAMERA_PROCESS_NAMES, "before": before, "actions": actions, "after": list_processes_by_name(KNOWN_CAMERA_PROCESS_NAMES)}
+
+    if policy == "error_only":
+        if before:
+            raise RuntimeError(f"Câmera possivelmente ocupada por processo conhecido: {before}")
+        return {"policy": policy, "known_process_names": KNOWN_CAMERA_PROCESS_NAMES, "before": before, "actions": actions, "after": list_processes_by_name(KNOWN_CAMERA_PROCESS_NAMES)}
+
+    if policy == "stop_known_processes":
+        for proc in before:
+            pid = int(proc["pid"])
+            append_log(log_file, f"Stopping camera conflict process pid={pid}, comm={proc['comm']}")
+            stopped = stop_pid(pid, log_file, timeout=timeout)
+            actions.append({"pid": pid, "comm": proc["comm"], "stopped": stopped})
+        after = list_processes_by_name(KNOWN_CAMERA_PROCESS_NAMES)
+        if after:
+            raise RuntimeError(f"Não foi possível liberar processos conhecidos da câmera: {after}")
+        return {"policy": policy, "known_process_names": KNOWN_CAMERA_PROCESS_NAMES, "before": before, "actions": actions, "after": after}
+
+    raise ValueError(f"camera_conflict_policy inválida: {policy}")
 
 
 def file_info(path: Path) -> Dict[str, Any]:
@@ -339,7 +450,7 @@ def validate_config(config: Dict[str, Any]) -> None:
     if int(config["cycle_period_s"]) < int(config["duration"]):
         raise ValueError(f"cycle_period_s precisa ser maior ou igual a record_duration_s/duration. Recebido: cycle_period_s={config['cycle_period_s']}, duration={config['duration']}")
     if str(config["run_mode"]).lower() != "single":
-        raise ValueError(f"Na v0.5, apenas run_mode=single é suportado. Recebido: run_mode={config['run_mode']}")
+        raise ValueError(f"Na v0.6, apenas run_mode=single é suportado. Recebido: run_mode={config['run_mode']}")
     for key in ("width", "height", "fps", "bitrate"):
         if int(config[key]) <= 0:
             raise ValueError(f"{key} precisa ser maior que zero.")
@@ -347,6 +458,10 @@ def validate_config(config: Dict[str, Any]) -> None:
         raise ValueError("start_delay não pode ser negativo.")
     if float(config["extra_timeout"]) < 0:
         raise ValueError("extra_timeout não pode ser negativo.")
+    if float(config["camera_startup_check_s"]) < 0:
+        raise ValueError("camera_startup_check_s não pode ser negativo.")
+    if float(config["camera_stop_timeout_s"]) < 0:
+        raise ValueError("camera_stop_timeout_s não pode ser negativo.")
     if not str(config["media_dir"]).strip():
         raise ValueError("media_dir não pode ser vazio.")
     if not str(config["audio_device"]).strip():
@@ -356,6 +471,9 @@ def validate_config(config: Dict[str, Any]) -> None:
     max_storage_percent = float(config["max_storage_percent"])
     if max_storage_percent <= 0 or max_storage_percent > 100:
         raise ValueError("max_storage_percent precisa estar entre 0 e 100.")
+    policy = str(config["camera_conflict_policy"]).lower()
+    if policy not in ("error_only", "stop_known_processes", "ignore"):
+        raise ValueError("camera_conflict_policy precisa ser error_only, stop_known_processes ou ignore.")
 
 
 def write_status_files(status_dir: Path, metadata: Dict[str, Any], status: str, error_message: Optional[str]) -> None:
@@ -433,8 +551,12 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
     h264_deleted = False
     storage_before: Optional[Dict[str, Any]] = None
     storage_after: Optional[Dict[str, Any]] = None
+    camera_conflicts: Optional[Dict[str, Any]] = None
+    audio_started = False
     timing: Dict[str, Optional[float]] = {
         "storage_check_s": None,
+        "camera_conflict_check_s": None,
+        "camera_startup_check_s": None,
         "recording_s": None,
         "video_mp4_processing_s": None,
         "delete_h264_s": None,
@@ -480,7 +602,11 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
             "max_storage_percent": float(config["max_storage_percent"]),
             "prefer_external_storage": bool(config["prefer_external_storage"]),
             "allow_local_fallback": bool(config["allow_local_fallback"]),
+            "camera_conflict_policy": str(config["camera_conflict_policy"]),
+            "camera_startup_check_s": float(config["camera_startup_check_s"]),
+            "camera_stop_timeout_s": float(config["camera_stop_timeout_s"]),
         },
+        "camera": {"conflicts": None, "audio_started": False},
         "storage": {"before": None, "after": None},
         "commands": {},
         "timing": timing,
@@ -502,6 +628,10 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
         timing["storage_check_s"] = round(time.monotonic() - storage_t0, 3)
         append_log(log_file, f"Storage before recording: {storage_before['used_percent']}% used, {storage_before['free_mb']} MB free")
 
+        camera_t0 = time.monotonic()
+        camera_conflicts = handle_camera_conflicts(config, log_file)
+        timing["camera_conflict_check_s"] = round(time.monotonic() - camera_t0, 3)
+
         raspivid = which_or_fail("raspivid")
         arecord = which_or_fail("arecord")
         ffmpeg = which_or_fail("ffmpeg")
@@ -517,15 +647,36 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
         append_log(log_file, f"Run mode: {config['run_mode']}")
         append_log(log_file, f"Duration requested: {duration} s")
         append_log(log_file, f"Cycle period configured: {config['cycle_period_s']} s")
+        append_log(log_file, f"Camera conflict policy: {config['camera_conflict_policy']}")
         append_log(log_file, f"Temporary H264: {temp_h264}")
         append_log(log_file, f"Final MP4 video: {video_mp4}")
         append_log(log_file, f"Audio WAV: {audio_wav}")
 
         recording_t0 = time.monotonic()
-        audio_proc = start_process(audio_cmd, log_file)
-        time.sleep(float(config["start_delay"]))
+
+        # v0.6: inicia o vídeo primeiro e verifica se raspivid falha imediatamente.
         video_proc = start_process(video_cmd, log_file)
-        video_rc = video_proc.wait(timeout=duration + float(config["extra_timeout"]))
+        startup_t0 = time.monotonic()
+        camera_startup_check_s = float(config["camera_startup_check_s"])
+        if camera_startup_check_s > 0:
+            time.sleep(camera_startup_check_s)
+        timing["camera_startup_check_s"] = round(time.monotonic() - startup_t0, 3)
+
+        if video_proc.poll() is not None:
+            video_rc_early = video_proc.returncode
+            close_proc_log(video_proc)
+            raise RuntimeError(
+                "raspivid falhou durante checagem inicial da câmera; "
+                f"return code {video_rc_early}. Áudio não foi iniciado."
+            )
+
+        if float(config["start_delay"]) > 0:
+            time.sleep(float(config["start_delay"]))
+
+        audio_proc = start_process(audio_cmd, log_file)
+        audio_started = True
+
+        video_rc = video_proc.wait(timeout=duration + float(config["extra_timeout"]) + camera_startup_check_s)
         audio_rc = audio_proc.wait(timeout=duration + float(config["extra_timeout"]))
         close_proc_log(video_proc)
         close_proc_log(audio_proc)
@@ -584,6 +735,7 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
         metadata["duration_actual_s"] = round(total_elapsed, 3)
         metadata["timing"] = timing
         metadata["storage"] = {"before": storage_before, "after": storage_after}
+        metadata["camera"] = {"conflicts": camera_conflicts, "audio_started": audio_started}
         metadata["h264_deleted"] = h264_deleted
         metadata["files"] = {
             "video_mp4": file_info(video_mp4),
@@ -605,7 +757,7 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Poracam v0.5: gravação MP4/WAV com config.txt e armazenamento externo PORACAM.")
+    parser = argparse.ArgumentParser(description="Poracam v0.6: gravação MP4/WAV com proteção contra câmera ocupada.")
     parser.add_argument("--config", default=None, help="Caminho para o config.txt. Se omitido, procura armazenamento externo e fallback local.")
     parser.add_argument("--ignore-external-storage", action="store_true", help="Ignora busca por /media/*/*/PORACAM/config.txt e /mnt/*/PORACAM/config.txt.")
     parser.add_argument("--allow-local-fallback", action="store_true", default=None, help="Permite fallback local. Campo reservado para uso futuro.")
@@ -622,6 +774,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--start-delay", type=float, default=None, help="Atraso entre início do áudio e início do vídeo.")
     parser.add_argument("--extra-timeout", type=float, default=None, help="Tempo extra para aguardar processos finalizarem.")
     parser.add_argument("--max-storage-percent", type=float, default=None, help="Uso máximo permitido do armazenamento, em porcentagem.")
+    parser.add_argument("--camera-conflict-policy", default=None, help="error_only, stop_known_processes ou ignore.")
+    parser.add_argument("--camera-startup-check-s", type=float, default=None, help="Tempo para verificar se raspivid falha logo no início.")
+    parser.add_argument("--camera-stop-timeout-s", type=float, default=None, help="Tempo para tentar parar processos conhecidos da câmera.")
     parser.add_argument("--keep-h264", action="store_true", default=None, help="Mantém o arquivo .h264 temporário após gerar o MP4.")
     parser.add_argument("--version", action="version", version=f"Poracam {PROJECT_VERSION}")
     return parser

@@ -1,63 +1,45 @@
-# config.txt — Poracam v0.5
+# config.txt — Poracam v0.6
 # Formato: chave=valor
 # Linhas começando com # são comentários.
 
-# Modo de execução.
-# Na v0.5, apenas "single" é suportado.
-# single = executa uma gravação e encerra.
 run_mode=single
 
 # Duração de cada gravação, em segundos.
-# Exemplos:
-# 60  = 1 minuto
-# 300 = 5 minutos
-# 600 = 10 minutos
 record_duration_s=60
 
-# Período total do ciclo, em segundos.
-# Ainda não executa loop na v0.5, mas já é validado.
-# Exemplo: 300 = configuração compatível com "gravar 1 min a cada 5 min".
-# Regra: cycle_period_s precisa ser maior ou igual a record_duration_s.
+# Período total do ciclo, em segundos. Ainda não executa loop na v0.6.
 cycle_period_s=300
 
-# Diretório onde os arquivos serão salvos.
-# IMPORTANTE:
-# - Se este config.txt estiver no armazenamento externo em PORACAM/config.txt
-#   e media_dir ficar comentado/ausente, o Poracam salvará automaticamente em PORACAM/media.
-# - Se quiser forçar um caminho específico, descomente e ajuste:
+# Para uso em pendrive/SSD, deixe media_dir comentado/ausente.
+# Assim, se este arquivo estiver em PORACAM/config.txt, o Poracam salva em PORACAM/media.
 # media_dir=/home/fishcam/poracam/media
 
-# Limite máximo de uso do armazenamento antes de gravar.
-# Se o filesystem estiver com uso maior ou igual a este valor, a gravação não inicia.
 max_storage_percent=95
-
-# Configuração de armazenamento externo.
 prefer_external_storage=true
 allow_local_fallback=true
 
-# Configuração de vídeo.
 width=1280
 height=720
 fps=30
 bitrate=2500000
 
-# Configuração de áudio.
-# Use "default" se já estiver funcionando.
-# Para descobrir dispositivos:
-# arecord -l
-# Exemplo alternativo:
-# audio_device=plughw:1,0
 audio_device=default
 audio_format=cd
-
-# Se false, o .h264 temporário será apagado depois que o .mp4 for gerado.
-# Padrão recomendado: false
 keep_h264=false
 
-# Atraso intencional antes de iniciar o vídeo, após iniciar o áudio.
-# 0.2 significa que o áudio começa cerca de 0,2 s antes do vídeo.
-# Use 0 para iniciar ambos quase em sequência.
+# Política contra câmera ocupada por RPiCam/raspimjpeg, motion etc.
+# Opções: error_only, stop_known_processes, ignore
+camera_conflict_policy=stop_known_processes
+
+# Tempo para checar se o raspivid falha logo no início.
+# Se falhar nesse período, o áudio não é iniciado.
+camera_startup_check_s=1.0
+
+# Tempo para tentar parar processos conhecidos da câmera.
+camera_stop_timeout_s=5.0
+
+# Na v0.6 o vídeo inicia primeiro. Este atraso é aplicado antes de iniciar o áudio,
+# depois que o vídeo passou na checagem inicial.
 start_delay_s=0.2
 
-# Tempo extra para aguardar raspivid/arecord finalizarem.
 extra_timeout_s=15
