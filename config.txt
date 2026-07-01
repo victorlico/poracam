@@ -1,6 +1,11 @@
-# config.txt — Poracam v0.3
+# config.txt — Poracam v0.4
 # Formato: chave=valor
 # Linhas começando com # são comentários.
+
+# Modo de execução.
+# Na v0.4, apenas "single" é suportado.
+# single = executa uma gravação e encerra.
+run_mode=single
 
 # Duração de cada gravação, em segundos.
 # Exemplos:
@@ -9,8 +14,18 @@
 # 600 = 10 minutos
 record_duration_s=60
 
+# Período total do ciclo, em segundos.
+# Ainda não executa loop na v0.4, mas já é validado.
+# Exemplo: 300 = configuração compatível com "gravar 1 min a cada 5 min".
+# Regra: cycle_period_s precisa ser maior ou igual a record_duration_s.
+cycle_period_s=300
+
 # Diretório onde os arquivos serão salvos.
 media_dir=/home/fishcam/poracam/media
+
+# Limite máximo de uso do armazenamento antes de gravar.
+# Se o filesystem estiver com uso maior ou igual a este valor, a gravação não inicia.
+max_storage_percent=95
 
 # Configuração de vídeo.
 width=1280
@@ -31,7 +46,9 @@ audio_format=cd
 # Padrão recomendado: false
 keep_h264=false
 
-# Atraso entre início do áudio e início do vídeo, em segundos.
+# Atraso intencional antes de iniciar o vídeo, após iniciar o áudio.
+# 0.2 significa que o áudio começa cerca de 0,2 s antes do vídeo.
+# Use 0 para iniciar ambos quase em sequência.
 start_delay_s=0.2
 
 # Tempo extra para aguardar raspivid/arecord finalizarem.
