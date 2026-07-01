@@ -1,0 +1,38 @@
+# config.txt — Poracam v0.3
+# Formato: chave=valor
+# Linhas começando com # são comentários.
+
+# Duração de cada gravação, em segundos.
+# Exemplos:
+# 60  = 1 minuto
+# 300 = 5 minutos
+# 600 = 10 minutos
+record_duration_s=60
+
+# Diretório onde os arquivos serão salvos.
+media_dir=/home/fishcam/poracam/media
+
+# Configuração de vídeo.
+width=1280
+height=720
+fps=30
+bitrate=2500000
+
+# Configuração de áudio.
+# Use "default" se já estiver funcionando.
+# Para descobrir dispositivos:
+# arecord -l
+# Exemplo alternativo:
+# audio_device=plughw:1,0
+audio_device=default
+audio_format=cd
+
+# Se false, o .h264 temporário será apagado depois que o .mp4 for gerado.
+# Padrão recomendado: false
+keep_h264=false
+
+# Atraso entre início do áudio e início do vídeo, em segundos.
+start_delay_s=0.2
+
+# Tempo extra para aguardar raspivid/arecord finalizarem.
+extra_timeout_s=15
