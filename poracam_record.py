@@ -1,30 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-poracam_record.py — Poracam v0.4
+poracam_record.py — Poracam v0.5
 
-Gravador simples para Raspberry Pi Zero W com Raspberry Pi OS Buster.
-
-Características da v0.4:
-- Lê configuração de um arquivo chamado config.txt.
-- Mantém argumentos de linha de comando como override.
-- Adiciona run_mode=single.
-- Adiciona cycle_period_s para validação futura de ciclos.
-- Adiciona max_storage_percent.
-- Verifica uso do armazenamento antes de gravar.
-- Registra informações de armazenamento no metadata.
-- Grava vídeo com raspivid em .h264 temporário.
-- Grava áudio com arecord em .wav.
-- Gera vídeo final .mp4 por padrão usando ffmpeg sem recodificar o vídeo.
-- Remove o .h264 automaticamente após o .mp4 ser criado com sucesso.
-- Salva áudio e vídeo separados.
-- Organiza saída em pastas: video/, audio/, temp/, logs/, metadata/.
-- Mede tempos de gravação, remux, sync e execução total.
-- Gera metadata JSON e log da execução.
+Novidades da v0.5:
+- Procura armazenamento externo com PORACAM/config.txt em /media/*/* e /mnt/*.
+- Se encontrar config externo, usa esse config e salva em PORACAM/media quando media_dir não estiver definido.
+- Mantém fallback local.
+- Cria arquivos de status em PORACAM/status ou no diretório pai de media/.
+- Mantém lógica validada: vídeo MP4 final, áudio WAV separado, H264 temporário apagado.
 """
 
 import argparse
 import datetime as dt
+import glob
 import json
 import os
 import shutil
@@ -36,7 +25,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 PROJECT_NAME = "poracam"
-PROJECT_VERSION = "0.4"
+PROJECT_VERSION = "0.5"
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "duration": 60,
@@ -53,6 +42,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "start_delay": 0.2,
     "extra_timeout": 15.0,
     "max_storage_percent": 95.0,
+    "prefer_external_storage": True,
+    "allow_local_fallback": True,
 }
 
 CONFIG_KEY_ALIASES = {
@@ -66,6 +57,8 @@ CONFIG_KEY_ALIASES = {
     "start_delay": "start_delay", "start_delay_s": "start_delay",
     "extra_timeout": "extra_timeout", "extra_timeout_s": "extra_timeout",
     "max_storage_percent": "max_storage_percent", "storage_max_percent": "max_storage_percent",
+    "prefer_external_storage": "prefer_external_storage",
+    "allow_local_fallback": "allow_local_fallback",
 }
 
 
@@ -109,14 +102,29 @@ def parse_value(key: str, raw_value: str) -> Any:
         return int(value)
     if key in ("start_delay", "extra_timeout", "max_storage_percent"):
         return float(value)
-    if key in ("keep_h264", "delete_h264_after_mp4"):
+    if key in ("keep_h264", "delete_h264_after_mp4", "prefer_external_storage", "allow_local_fallback"):
         return parse_bool(value)
     if key == "run_mode":
         return value.strip().lower()
     return value
 
 
-def find_default_config_path() -> Optional[Path]:
+def find_external_config_path() -> Optional[Path]:
+    patterns = [
+        "/media/*/*/PORACAM/config.txt",
+        "/mnt/*/PORACAM/config.txt",
+    ]
+    candidates: List[Path] = []
+    for pattern in patterns:
+        for match in glob.glob(pattern):
+            p = Path(match)
+            if p.exists() and p.is_file():
+                candidates.append(p.resolve())
+    candidates = sorted(set(candidates), key=lambda p: str(p))
+    return candidates[0] if candidates else None
+
+
+def find_local_config_path() -> Optional[Path]:
     candidates = [
         Path.cwd() / "config.txt",
         Path(__file__).resolve().parent / "config.txt",
@@ -125,23 +133,38 @@ def find_default_config_path() -> Optional[Path]:
     ]
     seen = set()
     for candidate in candidates:
-        resolved = str(candidate)
-        if resolved in seen:
+        key = str(candidate)
+        if key in seen:
             continue
-        seen.add(resolved)
+        seen.add(key)
         if candidate.exists() and candidate.is_file():
-            return candidate
+            return candidate.resolve()
     return None
 
 
-def load_config_file(path: Optional[Path]) -> Tuple[Dict[str, Any], Optional[str], List[str]]:
+def determine_config_path(args: argparse.Namespace) -> Tuple[Optional[Path], str, bool, List[str]]:
     warnings: List[str] = []
+    if args.config is not None:
+        return Path(args.config).expanduser().resolve(), "cli", False, warnings
+    if not args.ignore_external_storage:
+        external = find_external_config_path()
+        if external is not None:
+            return external, "external", True, warnings
+    local = find_local_config_path()
+    if local is not None:
+        return local, "local", False, warnings
+    warnings.append("Nenhum config.txt encontrado; usando defaults internos.")
+    return None, "none", False, warnings
+
+
+def load_config_file(path: Optional[Path]) -> Tuple[Dict[str, Any], Optional[str], List[str], bool]:
+    warnings: List[str] = []
+    media_dir_was_defined = False
     if path is None:
-        return {}, None, warnings
+        return {}, None, warnings, media_dir_was_defined
     if not path.exists():
         warnings.append(f"Arquivo de configuração não encontrado: {path}")
-        return {}, None, warnings
-
+        return {}, None, warnings, media_dir_was_defined
     config: Dict[str, Any] = {}
     with path.open("r", encoding="utf-8") as f:
         for line_number, line in enumerate(f, start=1):
@@ -171,17 +194,21 @@ def load_config_file(path: Optional[Path]) -> Tuple[Dict[str, Any], Optional[str
                 config["keep_h264"] = not bool(parsed)
             else:
                 config[canonical_key] = parsed
-    return config, str(path), warnings
+            if canonical_key == "media_dir":
+                media_dir_was_defined = True
+    return config, str(path), warnings, media_dir_was_defined
 
 
-def merge_config(args: argparse.Namespace) -> Tuple[Dict[str, Any], Optional[str], List[str]]:
+def merge_config(args: argparse.Namespace) -> Tuple[Dict[str, Any], Optional[str], str, bool, List[str]]:
     final_config = dict(DEFAULT_CONFIG)
-    warnings: List[str] = []
-    config_path = Path(args.config).expanduser().resolve() if args.config is not None else find_default_config_path()
-    file_config, config_source, file_warnings = load_config_file(config_path)
+    config_path, source_type, external_used, warnings = determine_config_path(args)
+    file_config, config_source, file_warnings, media_dir_was_defined = load_config_file(config_path)
     warnings.extend(file_warnings)
     final_config.update(file_config)
-
+    if external_used and config_path is not None and not media_dir_was_defined:
+        poracam_root = config_path.parent
+        final_config["media_dir"] = str(poracam_root / "media")
+        warnings.append(f"media_dir não definido no config externo; usando automaticamente {final_config['media_dir']}")
     cli_overrides = {
         "duration": args.duration,
         "cycle_period_s": args.cycle_period_s,
@@ -197,11 +224,13 @@ def merge_config(args: argparse.Namespace) -> Tuple[Dict[str, Any], Optional[str
         "start_delay": args.start_delay,
         "extra_timeout": args.extra_timeout,
         "max_storage_percent": args.max_storage_percent,
+        "prefer_external_storage": False if args.ignore_external_storage else None,
+        "allow_local_fallback": args.allow_local_fallback,
     }
     for key, value in cli_overrides.items():
         if value is not None:
             final_config[key] = str(value).lower() if key == "run_mode" else value
-    return final_config, config_source, warnings
+    return final_config, config_source, source_type, external_used, warnings
 
 
 def run_command(command: List[str], log_file: Path, check: bool = True) -> subprocess.CompletedProcess:
@@ -289,10 +318,7 @@ def get_storage_info(path: Path) -> Dict[str, Any]:
 def check_storage_or_fail(path: Path, max_storage_percent: float) -> Dict[str, Any]:
     info = get_storage_info(path)
     if info["used_percent"] >= max_storage_percent:
-        raise RuntimeError(
-            "Uso do armazenamento acima do limite: "
-            f"{info['used_percent']}% usado, limite={max_storage_percent}%"
-        )
+        raise RuntimeError(f"Uso do armazenamento acima do limite: {info['used_percent']}% usado, limite={max_storage_percent}%")
     return info
 
 
@@ -311,24 +337,12 @@ def validate_config(config: Dict[str, Any]) -> None:
     if int(config["cycle_period_s"]) <= 0:
         raise ValueError("cycle_period_s precisa ser maior que zero.")
     if int(config["cycle_period_s"]) < int(config["duration"]):
-        raise ValueError(
-            "cycle_period_s precisa ser maior ou igual a record_duration_s/duration. "
-            f"Recebido: cycle_period_s={config['cycle_period_s']}, duration={config['duration']}"
-        )
-    run_mode = str(config["run_mode"]).lower()
-    if run_mode != "single":
-        raise ValueError(
-            "Na v0.4, apenas run_mode=single é suportado. "
-            f"Recebido: run_mode={config['run_mode']}"
-        )
-    if int(config["width"]) <= 0:
-        raise ValueError("width precisa ser maior que zero.")
-    if int(config["height"]) <= 0:
-        raise ValueError("height precisa ser maior que zero.")
-    if int(config["fps"]) <= 0:
-        raise ValueError("fps precisa ser maior que zero.")
-    if int(config["bitrate"]) <= 0:
-        raise ValueError("bitrate precisa ser maior que zero.")
+        raise ValueError(f"cycle_period_s precisa ser maior ou igual a record_duration_s/duration. Recebido: cycle_period_s={config['cycle_period_s']}, duration={config['duration']}")
+    if str(config["run_mode"]).lower() != "single":
+        raise ValueError(f"Na v0.5, apenas run_mode=single é suportado. Recebido: run_mode={config['run_mode']}")
+    for key in ("width", "height", "fps", "bitrate"):
+        if int(config[key]) <= 0:
+            raise ValueError(f"{key} precisa ser maior que zero.")
     if float(config["start_delay"]) < 0:
         raise ValueError("start_delay não pode ser negativo.")
     if float(config["extra_timeout"]) < 0:
@@ -344,20 +358,66 @@ def validate_config(config: Dict[str, Any]) -> None:
         raise ValueError("max_storage_percent precisa estar entre 0 e 100.")
 
 
-def record(config: Dict[str, Any], config_source: Optional[str], config_warnings: List[str]) -> int:
+def write_status_files(status_dir: Path, metadata: Dict[str, Any], status: str, error_message: Optional[str]) -> None:
+    ensure_dir(status_dir)
+    last_run_file = status_dir / "last_run.json"
+    last_error_file = status_dir / "last_error.txt"
+    status_txt_file = status_dir / "poracam_status.txt"
+    summary = {
+        "project": metadata.get("project"),
+        "version": metadata.get("version"),
+        "last_status": status,
+        "last_start_time": metadata.get("start_time"),
+        "last_end_time": metadata.get("end_time"),
+        "video_mp4": metadata.get("paths", {}).get("video_mp4"),
+        "audio_wav": metadata.get("paths", {}).get("audio_wav"),
+        "metadata": metadata.get("paths", {}).get("metadata"),
+        "config_source": metadata.get("config_source"),
+        "config_source_type": metadata.get("config_source_type"),
+        "external_storage_used": metadata.get("external_storage_used"),
+        "error": error_message,
+    }
+    with last_run_file.open("w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+    lines = [
+        f"Poracam status: {status}",
+        f"Versao: {metadata.get('version')}",
+        f"Inicio: {metadata.get('start_time')}",
+        f"Fim: {metadata.get('end_time')}",
+        f"Config: {metadata.get('config_source')}",
+        f"Origem config: {metadata.get('config_source_type')}",
+        f"Armazenamento externo: {metadata.get('external_storage_used')}",
+        f"Video: {metadata.get('paths', {}).get('video_mp4')}",
+        f"Audio: {metadata.get('paths', {}).get('audio_wav')}",
+        f"Metadata: {metadata.get('paths', {}).get('metadata')}",
+    ]
+    if error_message:
+        lines.append(f"Erro: {error_message}")
+    with status_txt_file.open("w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    if error_message:
+        with last_error_file.open("w", encoding="utf-8") as f:
+            f.write(f"{iso_now()}\n{error_message}\n")
+    elif last_error_file.exists():
+        last_error_file.unlink()
+
+
+def record(config: Dict[str, Any], config_source: Optional[str], config_source_type: str, external_storage_used: bool, config_warnings: List[str]) -> int:
     validate_config(config)
     total_t0 = time.monotonic()
     start_iso = iso_now()
     stamp = now_stamp()
     duration = int(config["duration"])
     media_dir = Path(str(config["media_dir"])).expanduser().resolve()
+    poracam_root = media_dir.parent
+    status_dir = poracam_root / "status"
 
     video_dir = media_dir / "video"
     audio_dir = media_dir / "audio"
     temp_dir = media_dir / "temp"
     log_dir = media_dir / "logs"
     metadata_dir = media_dir / "metadata"
-    for directory in [video_dir, audio_dir, temp_dir, log_dir, metadata_dir]:
+    for directory in [video_dir, audio_dir, temp_dir, log_dir, metadata_dir, status_dir]:
         ensure_dir(directory)
 
     log_file = log_dir / f"{stamp}_poracam.log"
@@ -373,7 +433,6 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_warnings
     h264_deleted = False
     storage_before: Optional[Dict[str, Any]] = None
     storage_after: Optional[Dict[str, Any]] = None
-
     timing: Dict[str, Optional[float]] = {
         "storage_check_s": None,
         "recording_s": None,
@@ -392,8 +451,11 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_warnings
         "duration_requested_s": duration,
         "duration_actual_s": None,
         "config_source": config_source,
+        "config_source_type": config_source_type,
+        "external_storage_used": external_storage_used,
         "config_warnings": config_warnings,
         "media_dir": str(media_dir),
+        "status_dir": str(status_dir),
         "paths": {
             "video_mp4": str(video_mp4),
             "audio_wav": str(audio_wav),
@@ -416,6 +478,8 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_warnings
             "start_delay_s": float(config["start_delay"]),
             "extra_timeout_s": float(config["extra_timeout"]),
             "max_storage_percent": float(config["max_storage_percent"]),
+            "prefer_external_storage": bool(config["prefer_external_storage"]),
+            "allow_local_fallback": bool(config["allow_local_fallback"]),
         },
         "storage": {"before": None, "after": None},
         "commands": {},
@@ -428,6 +492,8 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_warnings
     try:
         append_log(log_file, f"Poracam v{PROJECT_VERSION} recording started")
         append_log(log_file, f"Config source: {config_source or 'internal defaults / CLI only'}")
+        append_log(log_file, f"Config source type: {config_source_type}")
+        append_log(log_file, f"External storage used: {external_storage_used}")
         for warning in config_warnings:
             append_log(log_file, f"CONFIG WARNING: {warning}")
 
@@ -439,26 +505,15 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_warnings
         raspivid = which_or_fail("raspivid")
         arecord = which_or_fail("arecord")
         ffmpeg = which_or_fail("ffmpeg")
-
-        video_cmd = [
-            raspivid, "-n", "-t", str(int(duration * 1000)),
-            "-w", str(int(config["width"])), "-h", str(int(config["height"])),
-            "-fps", str(int(config["fps"])), "-b", str(int(config["bitrate"])),
-            "-o", str(temp_h264),
-        ]
-        audio_cmd = [
-            arecord, "-D", str(config["audio_device"]), "-f", str(config["audio_format"]),
-            "-d", str(int(duration)), str(audio_wav),
-        ]
-        ffmpeg_cmd = [
-            ffmpeg, "-y", "-framerate", str(int(config["fps"])),
-            "-i", str(temp_h264), "-c:v", "copy", str(video_mp4),
-        ]
+        video_cmd = [raspivid, "-n", "-t", str(duration * 1000), "-w", str(int(config["width"])), "-h", str(int(config["height"])), "-fps", str(int(config["fps"])), "-b", str(int(config["bitrate"])), "-o", str(temp_h264)]
+        audio_cmd = [arecord, "-D", str(config["audio_device"]), "-f", str(config["audio_format"]), "-d", str(duration), str(audio_wav)]
+        ffmpeg_cmd = [ffmpeg, "-y", "-framerate", str(int(config["fps"])), "-i", str(temp_h264), "-c:v", "copy", str(video_mp4)]
         metadata["commands"]["video"] = video_cmd
         metadata["commands"]["audio"] = audio_cmd
         metadata["commands"]["ffmpeg_video_mp4"] = ffmpeg_cmd
 
         append_log(log_file, f"Media dir: {media_dir}")
+        append_log(log_file, f"Status dir: {status_dir}")
         append_log(log_file, f"Run mode: {config['run_mode']}")
         append_log(log_file, f"Duration requested: {duration} s")
         append_log(log_file, f"Cycle period configured: {config['cycle_period_s']} s")
@@ -475,11 +530,9 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_warnings
         close_proc_log(video_proc)
         close_proc_log(audio_proc)
         timing["recording_s"] = round(time.monotonic() - recording_t0, 3)
-
         append_log(log_file, f"Video return code: {video_rc}")
         append_log(log_file, f"Audio return code: {audio_rc}")
         append_log(log_file, f"Recording phase elapsed: {timing['recording_s']} s")
-
         if video_rc != 0:
             raise RuntimeError(f"raspivid terminou com erro: return code {video_rc}")
         if audio_rc != 0:
@@ -509,7 +562,6 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_warnings
         storage_after = get_storage_info(media_dir)
         append_log(log_file, f"Storage after recording: {storage_after['used_percent']}% used, {storage_after['free_mb']} MB free")
         status = "ok"
-
     except Exception as exc:
         status = "error"
         error_message = str(exc)
@@ -523,7 +575,6 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_warnings
             storage_after = get_storage_info(media_dir)
         except Exception:
             storage_after = None
-
     finally:
         end_iso = iso_now()
         total_elapsed = time.monotonic() - total_t0
@@ -543,19 +594,24 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_warnings
         metadata["error"] = error_message
         with metadata_file.open("w", encoding="utf-8") as f:
             json.dump(metadata, f, indent=2, ensure_ascii=False)
+        try:
+            write_status_files(status_dir, metadata, status, error_message)
+        except Exception as status_exc:
+            append_log(log_file, f"WARNING: failed to write status files: {status_exc}")
         append_log(log_file, f"Metadata saved: {metadata_file}")
         append_log(log_file, f"Final status: {status}")
         append_log(log_file, f"Total elapsed: {timing['total_s']} s")
-
     return 0 if status == "ok" else 1
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Poracam v0.4: gravação MP4/WAV com config.txt, validação e checagem de armazenamento.")
-    parser.add_argument("--config", default=None, help="Caminho para o config.txt. Se omitido, o script procura automaticamente.")
+    parser = argparse.ArgumentParser(description="Poracam v0.5: gravação MP4/WAV com config.txt e armazenamento externo PORACAM.")
+    parser.add_argument("--config", default=None, help="Caminho para o config.txt. Se omitido, procura armazenamento externo e fallback local.")
+    parser.add_argument("--ignore-external-storage", action="store_true", help="Ignora busca por /media/*/*/PORACAM/config.txt e /mnt/*/PORACAM/config.txt.")
+    parser.add_argument("--allow-local-fallback", action="store_true", default=None, help="Permite fallback local. Campo reservado para uso futuro.")
     parser.add_argument("--duration", type=int, default=None, help="Duração da gravação em segundos.")
     parser.add_argument("--cycle-period-s", type=int, default=None, help="Período total do ciclo em segundos.")
-    parser.add_argument("--run-mode", default=None, help="Modo de execução. Na v0.4, apenas 'single' é suportado.")
+    parser.add_argument("--run-mode", default=None, help="Modo de execução. Na v0.5, apenas 'single' é suportado.")
     parser.add_argument("--media-dir", default=None, help="Diretório base para salvar mídia, logs e metadados.")
     parser.add_argument("--width", type=int, default=None, help="Largura do vídeo.")
     parser.add_argument("--height", type=int, default=None, help="Altura do vídeo.")
@@ -575,8 +631,8 @@ def main() -> int:
     parser = build_arg_parser()
     args = parser.parse_args()
     try:
-        config, config_source, config_warnings = merge_config(args)
-        return record(config, config_source, config_warnings)
+        config, config_source, source_type, external_used, warnings = merge_config(args)
+        return record(config, config_source, source_type, external_used, warnings)
     except Exception as exc:
         print(f"Erro: {exc}", file=sys.stderr)
         return 2

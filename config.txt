@@ -1,9 +1,9 @@
-# config.txt — Poracam v0.4
+# config.txt — Poracam v0.5
 # Formato: chave=valor
 # Linhas começando com # são comentários.
 
 # Modo de execução.
-# Na v0.4, apenas "single" é suportado.
+# Na v0.5, apenas "single" é suportado.
 # single = executa uma gravação e encerra.
 run_mode=single
 
@@ -15,17 +15,25 @@ run_mode=single
 record_duration_s=60
 
 # Período total do ciclo, em segundos.
-# Ainda não executa loop na v0.4, mas já é validado.
+# Ainda não executa loop na v0.5, mas já é validado.
 # Exemplo: 300 = configuração compatível com "gravar 1 min a cada 5 min".
 # Regra: cycle_period_s precisa ser maior ou igual a record_duration_s.
 cycle_period_s=300
 
 # Diretório onde os arquivos serão salvos.
-media_dir=/home/fishcam/poracam/media
+# IMPORTANTE:
+# - Se este config.txt estiver no armazenamento externo em PORACAM/config.txt
+#   e media_dir ficar comentado/ausente, o Poracam salvará automaticamente em PORACAM/media.
+# - Se quiser forçar um caminho específico, descomente e ajuste:
+# media_dir=/home/fishcam/poracam/media
 
 # Limite máximo de uso do armazenamento antes de gravar.
 # Se o filesystem estiver com uso maior ou igual a este valor, a gravação não inicia.
 max_storage_percent=95
+
+# Configuração de armazenamento externo.
+prefer_external_storage=true
+allow_local_fallback=true
 
 # Configuração de vídeo.
 width=1280
