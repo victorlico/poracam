@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-poracam_record.py — Poracam v0.6
+poracam_record.py — Poracam v0.6.1
 
 Novidades da v0.6:
 - Procura armazenamento externo com PORACAM/config.txt em /media/*/* e /mnt/*.
@@ -25,10 +25,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 PROJECT_NAME = "poracam"
-PROJECT_VERSION = "0.6"
+PROJECT_VERSION = "0.6.1"
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "duration": 60,
+    "segment_duration_s": 600,
+    "enable_segment_split": True,
     "cycle_period_s": 300,
     "run_mode": "single",
     "media_dir": "/home/fishcam/poracam/media",
@@ -51,6 +53,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 
 CONFIG_KEY_ALIASES = {
     "record_duration_s": "duration", "duration_s": "duration", "duration": "duration",
+    "segment_duration_s": "segment_duration_s", "max_segment_duration_s": "segment_duration_s", "split_duration_s": "segment_duration_s",
+    "enable_segment_split": "enable_segment_split", "segment_split_enabled": "enable_segment_split",
     "cycle_period_s": "cycle_period_s", "cycle_s": "cycle_period_s", "period_s": "cycle_period_s",
     "run_mode": "run_mode", "mode": "run_mode",
     "media_dir": "media_dir", "output_dir": "media_dir",
@@ -104,7 +108,7 @@ def parse_bool(value: str) -> bool:
 
 def parse_value(key: str, raw_value: str) -> Any:
     value = raw_value.strip()
-    if key in ("duration", "cycle_period_s", "width", "height", "fps", "bitrate"):
+    if key in ("duration", "segment_duration_s", "cycle_period_s", "width", "height", "fps", "bitrate"):
         return int(value)
     if key in ("start_delay", "extra_timeout", "max_storage_percent", "camera_startup_check_s", "camera_stop_timeout_s"):
         return float(value)
@@ -217,6 +221,8 @@ def merge_config(args: argparse.Namespace) -> Tuple[Dict[str, Any], Optional[str
         warnings.append(f"media_dir não definido no config externo; usando automaticamente {final_config['media_dir']}")
     cli_overrides = {
         "duration": args.duration,
+        "segment_duration_s": args.segment_duration_s,
+        "enable_segment_split": args.enable_segment_split,
         "cycle_period_s": args.cycle_period_s,
         "run_mode": args.run_mode,
         "media_dir": args.media_dir,
@@ -445,12 +451,15 @@ def sync_filesystem(log_file: Path) -> float:
 def validate_config(config: Dict[str, Any]) -> None:
     if int(config["duration"]) <= 0:
         raise ValueError("duration/record_duration_s precisa ser maior que zero.")
+    if int(config["segment_duration_s"]) <= 0:
+        raise ValueError("segment_duration_s precisa ser maior que zero.")
+
     if int(config["cycle_period_s"]) <= 0:
         raise ValueError("cycle_period_s precisa ser maior que zero.")
     if int(config["cycle_period_s"]) < int(config["duration"]):
         raise ValueError(f"cycle_period_s precisa ser maior ou igual a record_duration_s/duration. Recebido: cycle_period_s={config['cycle_period_s']}, duration={config['duration']}")
     if str(config["run_mode"]).lower() != "single":
-        raise ValueError(f"Na v0.6, apenas run_mode=single é suportado. Recebido: run_mode={config['run_mode']}")
+        raise ValueError(f"Na v0.6.1, apenas run_mode=single é suportado. Recebido: run_mode={config['run_mode']}")
     for key in ("width", "height", "fps", "bitrate"):
         if int(config[key]) <= 0:
             raise ValueError(f"{key} precisa ser maior que zero.")
@@ -520,12 +529,232 @@ def write_status_files(status_dir: Path, metadata: Dict[str, Any], status: str, 
         last_error_file.unlink()
 
 
+def build_segment_plan(total_duration: int, segment_duration: int, enable_split: bool) -> List[int]:
+    if not enable_split or total_duration <= segment_duration:
+        return [total_duration]
+
+    plan: List[int] = []
+    remaining = total_duration
+    while remaining > 0:
+        current = min(segment_duration, remaining)
+        plan.append(current)
+        remaining -= current
+    return plan
+
+
+def segment_file_paths(stamp: str, segment_count: int, index: int, video_dir: Path, audio_dir: Path, temp_dir: Path) -> Tuple[Path, Path, Path, str]:
+    if segment_count <= 1:
+        suffix = ""
+        label = "single"
+    else:
+        label = f"part{index:03d}"
+        suffix = f"_{label}"
+
+    temp_h264 = temp_dir / f"{stamp}{suffix}_video.h264"
+    video_mp4 = video_dir / f"{stamp}{suffix}_video.mp4"
+    audio_wav = audio_dir / f"{stamp}{suffix}_audio.wav"
+    return temp_h264, video_mp4, audio_wav, label
+
+
+def record_one_segment(
+    *,
+    config: Dict[str, Any],
+    segment_index: int,
+    segment_count: int,
+    segment_duration: int,
+    stamp: str,
+    video_dir: Path,
+    audio_dir: Path,
+    temp_dir: Path,
+    log_file: Path,
+    raspivid: str,
+    arecord: str,
+    ffmpeg: str,
+) -> Dict[str, Any]:
+    temp_h264, video_mp4, audio_wav, label = segment_file_paths(
+        stamp, segment_count, segment_index, video_dir, audio_dir, temp_dir
+    )
+
+    video_proc: Optional[subprocess.Popen] = None
+    audio_proc: Optional[subprocess.Popen] = None
+    audio_started = False
+    h264_deleted = False
+
+    timing: Dict[str, Optional[float]] = {
+        "camera_startup_check_s": None,
+        "recording_s": None,
+        "video_mp4_processing_s": None,
+        "delete_h264_s": None,
+        "sync_s": None,
+        "total_s": None,
+    }
+
+    segment_t0 = time.monotonic()
+    segment_start = iso_now()
+
+    video_cmd = [
+        raspivid,
+        "-n",
+        "-t", str(int(segment_duration * 1000)),
+        "-w", str(int(config["width"])),
+        "-h", str(int(config["height"])),
+        "-fps", str(int(config["fps"])),
+        "-b", str(int(config["bitrate"])),
+        "-o", str(temp_h264),
+    ]
+
+    audio_cmd = [
+        arecord,
+        "-D", str(config["audio_device"]),
+        "-f", str(config["audio_format"]),
+        "-d", str(int(segment_duration)),
+        str(audio_wav),
+    ]
+
+    ffmpeg_cmd = [
+        ffmpeg,
+        "-y",
+        "-framerate", str(int(config["fps"])),
+        "-i", str(temp_h264),
+        "-c:v", "copy",
+        str(video_mp4),
+    ]
+
+    result: Dict[str, Any] = {
+        "index": segment_index,
+        "count": segment_count,
+        "label": label,
+        "status": "unknown",
+        "start_time": segment_start,
+        "end_time": None,
+        "duration_requested_s": segment_duration,
+        "duration_actual_s": None,
+        "paths": {
+            "video_mp4": str(video_mp4),
+            "audio_wav": str(audio_wav),
+            "temp_h264": str(temp_h264),
+        },
+        "commands": {
+            "video": video_cmd,
+            "audio": audio_cmd,
+            "ffmpeg_video_mp4": ffmpeg_cmd,
+        },
+        "timing": timing,
+        "files": {},
+        "audio_started": False,
+        "h264_deleted": False,
+        "error": None,
+    }
+
+    try:
+        append_log(log_file, f"Segment {segment_index}/{segment_count} started: duration={segment_duration}s, label={label}")
+        append_log(log_file, f"Segment temporary H264: {temp_h264}")
+        append_log(log_file, f"Segment final MP4: {video_mp4}")
+        append_log(log_file, f"Segment audio WAV: {audio_wav}")
+
+        recording_t0 = time.monotonic()
+
+        video_proc = start_process(video_cmd, log_file)
+        startup_t0 = time.monotonic()
+        camera_startup_check_s = float(config["camera_startup_check_s"])
+        if camera_startup_check_s > 0:
+            time.sleep(camera_startup_check_s)
+        timing["camera_startup_check_s"] = round(time.monotonic() - startup_t0, 3)
+
+        if video_proc.poll() is not None:
+            video_rc_early = video_proc.returncode
+            close_proc_log(video_proc)
+            raise RuntimeError(
+                "raspivid falhou durante checagem inicial da câmera; "
+                f"return code {video_rc_early}. Áudio não foi iniciado."
+            )
+
+        if float(config["start_delay"]) > 0:
+            time.sleep(float(config["start_delay"]))
+
+        audio_proc = start_process(audio_cmd, log_file)
+        audio_started = True
+        result["audio_started"] = True
+
+        video_rc = video_proc.wait(timeout=segment_duration + float(config["extra_timeout"]) + camera_startup_check_s)
+        audio_rc = audio_proc.wait(timeout=segment_duration + float(config["extra_timeout"]))
+
+        close_proc_log(video_proc)
+        close_proc_log(audio_proc)
+
+        timing["recording_s"] = round(time.monotonic() - recording_t0, 3)
+        append_log(log_file, f"Segment {segment_index}/{segment_count} video return code: {video_rc}")
+        append_log(log_file, f"Segment {segment_index}/{segment_count} audio return code: {audio_rc}")
+        append_log(log_file, f"Segment {segment_index}/{segment_count} recording elapsed: {timing['recording_s']} s")
+
+        if video_rc != 0:
+            raise RuntimeError(f"raspivid terminou com erro: return code {video_rc}")
+        if audio_rc != 0:
+            raise RuntimeError(f"arecord terminou com erro: return code {audio_rc}")
+        if not temp_h264.exists() or temp_h264.stat().st_size <= 0:
+            raise RuntimeError(f"Arquivo temporário H264 não foi criado corretamente: {temp_h264}")
+        if not audio_wav.exists() or audio_wav.stat().st_size <= 0:
+            raise RuntimeError(f"Arquivo de áudio WAV não foi criado corretamente: {audio_wav}")
+
+        mp4_t0 = time.monotonic()
+        run_command(ffmpeg_cmd, log_file, check=True)
+        timing["video_mp4_processing_s"] = round(time.monotonic() - mp4_t0, 3)
+
+        if not video_mp4.exists() or video_mp4.stat().st_size <= 0:
+            raise RuntimeError(f"Arquivo MP4 final não foi criado corretamente: {video_mp4}")
+
+        append_log(log_file, f"Segment {segment_index}/{segment_count} MP4 elapsed: {timing['video_mp4_processing_s']} s")
+
+        if not bool(config["keep_h264"]):
+            delete_t0 = time.monotonic()
+            h264_deleted = remove_file(temp_h264, log_file)
+            timing["delete_h264_s"] = round(time.monotonic() - delete_t0, 3)
+        else:
+            append_log(log_file, "Keeping H264 temporary file because keep_h264=true")
+            timing["delete_h264_s"] = 0.0
+
+        timing["sync_s"] = round(sync_filesystem(log_file), 3)
+        result["status"] = "ok"
+
+    except Exception as exc:
+        result["status"] = "error"
+        result["error"] = str(exc)
+        append_log(log_file, f"Segment {segment_index}/{segment_count} ERROR: {exc}")
+
+        if video_proc is not None and video_proc.poll() is None:
+            stop_process(video_proc, "raspivid", log_file)
+        if audio_proc is not None and audio_proc.poll() is None:
+            stop_process(audio_proc, "arecord", log_file)
+
+        timing["sync_s"] = round(sync_filesystem(log_file), 3)
+
+    finally:
+        result["end_time"] = iso_now()
+        result["duration_actual_s"] = round(time.monotonic() - segment_t0, 3)
+        timing["total_s"] = result["duration_actual_s"]
+        result["timing"] = timing
+        result["h264_deleted"] = h264_deleted
+        result["files"] = {
+            "video_mp4": file_info(video_mp4),
+            "audio_wav": file_info(audio_wav),
+            "temp_h264": file_info(temp_h264),
+        }
+        result["audio_started"] = audio_started
+
+    return result
+
+
 def record(config: Dict[str, Any], config_source: Optional[str], config_source_type: str, external_storage_used: bool, config_warnings: List[str]) -> int:
     validate_config(config)
     total_t0 = time.monotonic()
     start_iso = iso_now()
     stamp = now_stamp()
     duration = int(config["duration"])
+    segment_duration = int(config["segment_duration_s"])
+    enable_segment_split = bool(config["enable_segment_split"])
+    segment_plan = build_segment_plan(duration, segment_duration, enable_segment_split)
+    segment_count = len(segment_plan)
+
     media_dir = Path(str(config["media_dir"])).expanduser().resolve()
     poracam_root = media_dir.parent
     status_dir = poracam_root / "status"
@@ -540,29 +769,26 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
 
     log_file = log_dir / f"{stamp}_poracam.log"
     metadata_file = metadata_dir / f"{stamp}_metadata.json"
-    temp_h264 = temp_dir / f"{stamp}_video.h264"
-    video_mp4 = video_dir / f"{stamp}_video.mp4"
-    audio_wav = audio_dir / f"{stamp}_audio.wav"
 
     status = "unknown"
     error_message: Optional[str] = None
-    video_proc: Optional[subprocess.Popen] = None
-    audio_proc: Optional[subprocess.Popen] = None
-    h264_deleted = False
     storage_before: Optional[Dict[str, Any]] = None
     storage_after: Optional[Dict[str, Any]] = None
     camera_conflicts: Optional[Dict[str, Any]] = None
-    audio_started = False
+    segments: List[Dict[str, Any]] = []
+
     timing: Dict[str, Optional[float]] = {
         "storage_check_s": None,
         "camera_conflict_check_s": None,
-        "camera_startup_check_s": None,
-        "recording_s": None,
-        "video_mp4_processing_s": None,
-        "delete_h264_s": None,
-        "sync_s": None,
+        "segments_recording_s": None,
+        "segments_mp4_processing_s": None,
+        "segments_sync_s": None,
         "total_s": None,
     }
+
+    first_temp_h264, first_video_mp4, first_audio_wav, _ = segment_file_paths(
+        stamp, segment_count, 1, video_dir, audio_dir, temp_dir
+    )
 
     metadata: Dict[str, Any] = {
         "project": PROJECT_NAME,
@@ -579,15 +805,19 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
         "media_dir": str(media_dir),
         "status_dir": str(status_dir),
         "paths": {
-            "video_mp4": str(video_mp4),
-            "audio_wav": str(audio_wav),
-            "temp_h264": str(temp_h264),
+            "video_mp4": str(first_video_mp4),
+            "audio_wav": str(first_audio_wav),
+            "temp_h264": str(first_temp_h264),
             "log": str(log_file),
             "metadata": str(metadata_file),
         },
         "settings": {
             "run_mode": str(config["run_mode"]),
             "duration": duration,
+            "segment_duration_s": segment_duration,
+            "enable_segment_split": enable_segment_split,
+            "segment_count": segment_count,
+            "segment_plan_s": segment_plan,
             "cycle_period_s": int(config["cycle_period_s"]),
             "width": int(config["width"]),
             "height": int(config["height"]),
@@ -608,10 +838,10 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
         },
         "camera": {"conflicts": None, "audio_started": False},
         "storage": {"before": None, "after": None},
-        "commands": {},
+        "segments": [],
         "timing": timing,
         "files": {},
-        "h264_deleted": h264_deleted,
+        "h264_deleted": None,
         "error": None,
     }
 
@@ -635,115 +865,80 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
         raspivid = which_or_fail("raspivid")
         arecord = which_or_fail("arecord")
         ffmpeg = which_or_fail("ffmpeg")
-        video_cmd = [raspivid, "-n", "-t", str(duration * 1000), "-w", str(int(config["width"])), "-h", str(int(config["height"])), "-fps", str(int(config["fps"])), "-b", str(int(config["bitrate"])), "-o", str(temp_h264)]
-        audio_cmd = [arecord, "-D", str(config["audio_device"]), "-f", str(config["audio_format"]), "-d", str(duration), str(audio_wav)]
-        ffmpeg_cmd = [ffmpeg, "-y", "-framerate", str(int(config["fps"])), "-i", str(temp_h264), "-c:v", "copy", str(video_mp4)]
-        metadata["commands"]["video"] = video_cmd
-        metadata["commands"]["audio"] = audio_cmd
-        metadata["commands"]["ffmpeg_video_mp4"] = ffmpeg_cmd
 
         append_log(log_file, f"Media dir: {media_dir}")
         append_log(log_file, f"Status dir: {status_dir}")
         append_log(log_file, f"Run mode: {config['run_mode']}")
         append_log(log_file, f"Duration requested: {duration} s")
+        append_log(log_file, f"Segment split enabled: {enable_segment_split}")
+        append_log(log_file, f"Segment duration: {segment_duration} s")
+        append_log(log_file, f"Segment plan: {segment_plan}")
         append_log(log_file, f"Cycle period configured: {config['cycle_period_s']} s")
         append_log(log_file, f"Camera conflict policy: {config['camera_conflict_policy']}")
-        append_log(log_file, f"Temporary H264: {temp_h264}")
-        append_log(log_file, f"Final MP4 video: {video_mp4}")
-        append_log(log_file, f"Audio WAV: {audio_wav}")
 
-        recording_t0 = time.monotonic()
+        for idx, seg_duration in enumerate(segment_plan, start=1):
+            storage_now = check_storage_or_fail(media_dir, float(config["max_storage_percent"]))
+            append_log(log_file, f"Storage before segment {idx}/{segment_count}: {storage_now['used_percent']}% used, {storage_now['free_mb']} MB free")
 
-        # v0.6: inicia o vídeo primeiro e verifica se raspivid falha imediatamente.
-        video_proc = start_process(video_cmd, log_file)
-        startup_t0 = time.monotonic()
-        camera_startup_check_s = float(config["camera_startup_check_s"])
-        if camera_startup_check_s > 0:
-            time.sleep(camera_startup_check_s)
-        timing["camera_startup_check_s"] = round(time.monotonic() - startup_t0, 3)
-
-        if video_proc.poll() is not None:
-            video_rc_early = video_proc.returncode
-            close_proc_log(video_proc)
-            raise RuntimeError(
-                "raspivid falhou durante checagem inicial da câmera; "
-                f"return code {video_rc_early}. Áudio não foi iniciado."
+            segment = record_one_segment(
+                config=config,
+                segment_index=idx,
+                segment_count=segment_count,
+                segment_duration=seg_duration,
+                stamp=stamp,
+                video_dir=video_dir,
+                audio_dir=audio_dir,
+                temp_dir=temp_dir,
+                log_file=log_file,
+                raspivid=raspivid,
+                arecord=arecord,
+                ffmpeg=ffmpeg,
             )
+            segments.append(segment)
 
-        if float(config["start_delay"]) > 0:
-            time.sleep(float(config["start_delay"]))
+            if segment["status"] != "ok":
+                raise RuntimeError(f"Segmento {idx}/{segment_count} falhou: {segment.get('error')}")
 
-        audio_proc = start_process(audio_cmd, log_file)
-        audio_started = True
-
-        video_rc = video_proc.wait(timeout=duration + float(config["extra_timeout"]) + camera_startup_check_s)
-        audio_rc = audio_proc.wait(timeout=duration + float(config["extra_timeout"]))
-        close_proc_log(video_proc)
-        close_proc_log(audio_proc)
-        timing["recording_s"] = round(time.monotonic() - recording_t0, 3)
-        append_log(log_file, f"Video return code: {video_rc}")
-        append_log(log_file, f"Audio return code: {audio_rc}")
-        append_log(log_file, f"Recording phase elapsed: {timing['recording_s']} s")
-        if video_rc != 0:
-            raise RuntimeError(f"raspivid terminou com erro: return code {video_rc}")
-        if audio_rc != 0:
-            raise RuntimeError(f"arecord terminou com erro: return code {audio_rc}")
-        if not temp_h264.exists() or temp_h264.stat().st_size <= 0:
-            raise RuntimeError(f"Arquivo temporário H264 não foi criado corretamente: {temp_h264}")
-        if not audio_wav.exists() or audio_wav.stat().st_size <= 0:
-            raise RuntimeError(f"Arquivo de áudio WAV não foi criado corretamente: {audio_wav}")
-
-        mp4_t0 = time.monotonic()
-        run_command(ffmpeg_cmd, log_file, check=True)
-        timing["video_mp4_processing_s"] = round(time.monotonic() - mp4_t0, 3)
-        if not video_mp4.exists() or video_mp4.stat().st_size <= 0:
-            raise RuntimeError(f"Arquivo MP4 final não foi criado corretamente: {video_mp4}")
-        append_log(log_file, f"MP4 generation elapsed: {timing['video_mp4_processing_s']} s")
-
-        if not bool(config["keep_h264"]):
-            delete_t0 = time.monotonic()
-            h264_deleted = remove_file(temp_h264, log_file)
-            timing["delete_h264_s"] = round(time.monotonic() - delete_t0, 3)
-        else:
-            append_log(log_file, "Keeping H264 temporary file because keep_h264=true")
-            h264_deleted = False
-            timing["delete_h264_s"] = 0.0
-
-        timing["sync_s"] = round(sync_filesystem(log_file), 3)
         storage_after = get_storage_info(media_dir)
         append_log(log_file, f"Storage after recording: {storage_after['used_percent']}% used, {storage_after['free_mb']} MB free")
+
         status = "ok"
+
     except Exception as exc:
         status = "error"
         error_message = str(exc)
         append_log(log_file, f"ERROR: {error_message}")
-        if video_proc is not None and video_proc.poll() is None:
-            stop_process(video_proc, "raspivid", log_file)
-        if audio_proc is not None and audio_proc.poll() is None:
-            stop_process(audio_proc, "arecord", log_file)
-        timing["sync_s"] = round(sync_filesystem(log_file), 3)
         try:
             storage_after = get_storage_info(media_dir)
         except Exception:
             storage_after = None
+
     finally:
         end_iso = iso_now()
         total_elapsed = time.monotonic() - total_t0
         timing["total_s"] = round(total_elapsed, 3)
+        timing["segments_recording_s"] = round(sum((s.get("timing", {}).get("recording_s") or 0.0) for s in segments), 3)
+        timing["segments_mp4_processing_s"] = round(sum((s.get("timing", {}).get("video_mp4_processing_s") or 0.0) for s in segments), 3)
+        timing["segments_sync_s"] = round(sum((s.get("timing", {}).get("sync_s") or 0.0) for s in segments), 3)
+
+        all_h264_deleted = all(bool(s.get("h264_deleted")) for s in segments) if segments else False
+        any_audio_started = any(bool(s.get("audio_started")) for s in segments) if segments else False
+
         metadata["status"] = status
         metadata["end_time"] = end_iso
         metadata["duration_actual_s"] = round(total_elapsed, 3)
         metadata["timing"] = timing
         metadata["storage"] = {"before": storage_before, "after": storage_after}
-        metadata["camera"] = {"conflicts": camera_conflicts, "audio_started": audio_started}
-        metadata["h264_deleted"] = h264_deleted
+        metadata["camera"] = {"conflicts": camera_conflicts, "audio_started": any_audio_started}
+        metadata["segments"] = segments
+        metadata["h264_deleted"] = all_h264_deleted
         metadata["files"] = {
-            "video_mp4": file_info(video_mp4),
-            "audio_wav": file_info(audio_wav),
-            "temp_h264": file_info(temp_h264),
             "log": file_info(log_file),
+            "segments_ok": sum(1 for s in segments if s.get("status") == "ok"),
+            "segments_total": segment_count,
         }
         metadata["error"] = error_message
+
         with metadata_file.open("w", encoding="utf-8") as f:
             json.dump(metadata, f, indent=2, ensure_ascii=False)
         try:
@@ -757,12 +952,14 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Poracam v0.6: gravação MP4/WAV com proteção contra câmera ocupada.")
+    parser = argparse.ArgumentParser(description="Poracam v0.6.1: gravação MP4/WAV com proteção contra câmera ocupada.")
     parser.add_argument("--config", default=None, help="Caminho para o config.txt. Se omitido, procura armazenamento externo e fallback local.")
     parser.add_argument("--ignore-external-storage", action="store_true", help="Ignora busca por /media/*/*/PORACAM/config.txt e /mnt/*/PORACAM/config.txt.")
     parser.add_argument("--allow-local-fallback", action="store_true", default=None, help="Permite fallback local. Campo reservado para uso futuro.")
     parser.add_argument("--duration", type=int, default=None, help="Duração da gravação em segundos.")
     parser.add_argument("--cycle-period-s", type=int, default=None, help="Período total do ciclo em segundos.")
+    parser.add_argument("--segment-duration-s", type=int, default=None, help="Duração máxima de cada segmento, em segundos.")
+    parser.add_argument("--enable-segment-split", action="store_true", default=None, help="Habilita divisão da gravação em segmentos.")
     parser.add_argument("--run-mode", default=None, help="Modo de execução. Na v0.5, apenas 'single' é suportado.")
     parser.add_argument("--media-dir", default=None, help="Diretório base para salvar mídia, logs e metadados.")
     parser.add_argument("--width", type=int, default=None, help="Largura do vídeo.")

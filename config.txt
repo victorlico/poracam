@@ -1,45 +1,67 @@
-# config.txt — Poracam v0.6
+# config.txt — Poracam v0.6.1
 # Formato: chave=valor
 # Linhas começando com # são comentários.
 
+# Modo de execução.
+# Na v0.6.1, apenas "single" é suportado.
 run_mode=single
 
-# Duração de cada gravação, em segundos.
-record_duration_s=60
+# Duração total desejada da gravação, em segundos.
+# Exemplo: 600 = 10 minutos; 1800 = 30 minutos.
+record_duration_s=600
 
-# Período total do ciclo, em segundos. Ainda não executa loop na v0.6.
-cycle_period_s=300
+# Divisão em segmentos.
+# Se record_duration_s for maior que segment_duration_s, o Poracam grava em blocos.
+# Exemplo: record_duration_s=1800 e segment_duration_s=600 gera 3 arquivos de 10 min.
+enable_segment_split=true
+segment_duration_s=600
+
+# Período total do ciclo, em segundos.
+# Ainda não executa loop na v0.6.1, mas já é validado.
+# Para gravação com Witty Pi, este valor precisa incluir gravação + processamento + boot/shutdown.
+cycle_period_s=1200
 
 # Para uso em pendrive/SSD, deixe media_dir comentado/ausente.
-# Assim, se este arquivo estiver em PORACAM/config.txt, o Poracam salva em PORACAM/media.
+# Assim, se o config estiver em PORACAM/config.txt, o Poracam salva em PORACAM/media.
 # media_dir=/home/fishcam/poracam/media
 
+# Limite máximo de uso do armazenamento antes de gravar.
 max_storage_percent=95
+
+# Configuração de armazenamento externo.
 prefer_external_storage=true
 allow_local_fallback=true
 
-width=1280
-height=720
-fps=30
-bitrate=2500000
+# Perfil de vídeo validado em teste de 10 minutos.
+width=1920
+height=1080
+fps=25
+bitrate=4000000
 
+# Configuração de áudio.
+# Use "default" se já estiver funcionando.
+# Para descobrir dispositivos: arecord -l
 audio_device=default
 audio_format=cd
+
+# Se false, o .h264 temporário será apagado depois que o .mp4 for gerado.
 keep_h264=false
 
-# Política contra câmera ocupada por RPiCam/raspimjpeg, motion etc.
-# Opções: error_only, stop_known_processes, ignore
+# Política para câmera ocupada.
+# error_only = acusa erro se encontrar processo conhecido usando câmera.
+# stop_known_processes = tenta parar processos conhecidos antes de gravar.
+# ignore = não faz nada.
 camera_conflict_policy=stop_known_processes
 
-# Tempo para checar se o raspivid falha logo no início.
-# Se falhar nesse período, o áudio não é iniciado.
-camera_startup_check_s=1.0
+# Tempo para verificar se o raspivid falha logo após iniciar.
+camera_startup_check_s=0.5
 
 # Tempo para tentar parar processos conhecidos da câmera.
 camera_stop_timeout_s=5.0
 
-# Na v0.6 o vídeo inicia primeiro. Este atraso é aplicado antes de iniciar o áudio,
-# depois que o vídeo passou na checagem inicial.
-start_delay_s=0.2
+# Atraso adicional antes de iniciar o áudio, após a checagem inicial do vídeo.
+start_delay_s=0.1
 
-extra_timeout_s=15
+# Margem para aguardar raspivid/arecord finalizarem.
+# Para 1080p e blocos de até 10 min, 45 s funcionou no teste.
+extra_timeout_s=45
