@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-poracam_record.py — Poracam v0.7
+poracam_record.py — Poracam v0.7.1
 
-Novidades da v0.7:
+Novidades da v0.7.1:
 - Procura armazenamento externo com PORACAM/config.txt em /media/*/* e /mnt/*.
 - Se encontrar config externo, usa esse config e salva em PORACAM/media quando media_dir não estiver definido.
 - Mantém fallback local.
@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 PROJECT_NAME = "poracam"
-PROJECT_VERSION = "0.7"
+PROJECT_VERSION = "0.7.1"
 
 # ============================================================
 # Developer/internal configuration
@@ -42,8 +42,13 @@ ENABLE_SEGMENT_SPLIT = True
 DEFAULT_MEDIA_DIR = "/home/fishcam/poracam/media"
 MAX_STORAGE_PERCENT = 95.0
 
-AUDIO_DEVICE = "default"
+AUDIO_DEVICE = "auto"
 AUDIO_FORMAT = "cd"
+
+# v0.7.1: Witty Pi usually starts Poracam as root/system.
+# In that context ALSA PCM "default" may not exist, even if it works in an interactive shell.
+# "auto" probes default and then falls back to the first physical capture device from `arecord -l`.
+AUDIO_PROBE_SECONDS = 1
 
 KEEP_H264 = False
 
@@ -132,7 +137,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 }
 
 # User-facing keys accepted in config.txt.
-# Technical parameters are intentionally not accepted from config.txt in v0.7.
+# Technical parameters are intentionally not accepted from config.txt in v0.7.1.
 CONFIG_KEY_ALIASES = {
     "session_name": "session_name",
     "record_duration_min": "record_duration_min",
@@ -420,6 +425,127 @@ def merge_config(args: argparse.Namespace) -> Tuple[Dict[str, Any], Optional[str
     return final_config, config_source, source_type, external_used, warnings
 
 
+
+def run_quiet(command: List[str], timeout_s: int = 10) -> Tuple[int, str, str]:
+    try:
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout_s,
+            check=False,
+        )
+        return result.returncode, result.stdout or "", result.stderr or ""
+    except subprocess.TimeoutExpired as exc:
+        return 124, exc.stdout or "", exc.stderr or f"timeout after {timeout_s}s"
+    except Exception as exc:
+        return 1, "", str(exc)
+
+
+def parse_arecord_capture_devices(output: str) -> List[str]:
+    devices: List[str] = []
+    pattern = re.compile(r"card\s+(\d+):.*device\s+(\d+):", re.IGNORECASE)
+    for line in output.splitlines():
+        match = pattern.search(line)
+        if match:
+            dev = f"plughw:{match.group(1)},{match.group(2)}"
+            if dev not in devices:
+                devices.append(dev)
+    return devices
+
+
+def probe_audio_device(device: str, log_file: Path) -> Tuple[bool, str]:
+    probe_path = Path("/tmp/poracam_audio_probe.wav")
+    try:
+        if probe_path.exists():
+            probe_path.unlink()
+    except Exception:
+        pass
+
+    cmd = [
+        "/usr/bin/arecord",
+        "-D",
+        device,
+        "-f",
+        AUDIO_FORMAT,
+        "-d",
+        str(AUDIO_PROBE_SECONDS),
+        str(probe_path),
+    ]
+
+    rc, out, err = run_quiet(cmd, timeout_s=AUDIO_PROBE_SECONDS + 8)
+
+    try:
+        if probe_path.exists():
+            probe_path.unlink()
+    except Exception:
+        pass
+
+    msg = (out + "\n" + err).strip()
+    if rc == 0:
+        append_log(log_file, f"Audio probe OK: {device}")
+        return True, msg
+
+    append_log(log_file, f"Audio probe failed: {device}; rc={rc}; msg={msg}")
+    return False, msg
+
+
+def resolve_audio_device(config: Dict[str, Any], log_file: Path) -> Dict[str, Any]:
+    requested = str(config.get("audio_device", AUDIO_DEVICE)).strip()
+    result: Dict[str, Any] = {
+        "requested": requested,
+        "selected": None,
+        "method": "auto" if requested.lower() in ("auto", "") else "fixed",
+        "arecord_l": None,
+        "candidates": [],
+        "probe": [],
+    }
+
+    if requested.lower() not in ("auto", ""):
+        ok, msg = probe_audio_device(requested, log_file)
+        result["probe"].append({"device": requested, "ok": ok, "message": msg[-500:]})
+        if not ok:
+            raise RuntimeError(f"Dispositivo de áudio configurado falhou: {requested}. Detalhe: {msg}")
+        result["selected"] = requested
+        config["audio_device"] = requested
+        return result
+
+    candidates: List[str] = ["default"]
+
+    rc, out, err = run_quiet(["/usr/bin/arecord", "-l"], timeout_s=10)
+    result["arecord_l"] = (out + "\n" + err).strip()[-2000:]
+    if rc == 0:
+        candidates.extend(parse_arecord_capture_devices(out))
+    else:
+        append_log(log_file, f"WARNING: arecord -l failed; rc={rc}; msg={(out + err).strip()}")
+
+    candidates.extend(["plughw:1,0", "plughw:0,0"])
+
+    unique_candidates: List[str] = []
+    seen = set()
+    for dev in candidates:
+        if dev and dev not in seen:
+            seen.add(dev)
+            unique_candidates.append(dev)
+
+    result["candidates"] = unique_candidates
+
+    for dev in unique_candidates:
+        ok, msg = probe_audio_device(dev, log_file)
+        result["probe"].append({"device": dev, "ok": ok, "message": msg[-500:]})
+        if ok:
+            result["selected"] = dev
+            config["audio_device"] = dev
+            append_log(log_file, f"Selected audio device: {dev}")
+            return result
+
+    raise RuntimeError(
+        "Nenhum dispositivo de áudio funcionou. "
+        "Rode `arecord -l` e teste manualmente `arecord -D plughw:<card>,<device> -f cd -d 10 teste.wav`."
+    )
+
+
 def run_command(command: List[str], log_file: Path, check: bool = True) -> subprocess.CompletedProcess:
     with log_file.open("a", encoding="utf-8") as log:
         log.write(f"\n[{iso_now()}] RUN: {' '.join(map(str, command))}\n")
@@ -631,7 +757,7 @@ def validate_config(config: Dict[str, Any]) -> None:
     if int(config["cycle_period_s"]) < int(config["duration"]):
         raise ValueError(f"cycle_period_s precisa ser maior ou igual a record_duration_s/duration. Recebido: cycle_period_s={config['cycle_period_s']}, duration={config['duration']}")
     if str(config["run_mode"]).lower() != "single":
-        raise ValueError(f"Na v0.7, apenas run_mode=single é suportado. Recebido: run_mode={config['run_mode']}")
+        raise ValueError(f"Na v0.7.1, apenas run_mode=single é suportado. Recebido: run_mode={config['run_mode']}")
     for key in ("width", "height", "fps", "bitrate"):
         if int(config[key]) <= 0:
             raise ValueError(f"{key} precisa ser maior que zero.")
@@ -1164,6 +1290,7 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
     storage_after: Optional[Dict[str, Any]] = None
     camera_conflicts: Optional[Dict[str, Any]] = None
     segments: List[Dict[str, Any]] = []
+    audio_resolution: Dict[str, Any] = {"requested": AUDIO_DEVICE, "selected": None, "method": "unresolved"}
 
     timing: Dict[str, Optional[float]] = {
         "storage_check_s": None,
@@ -1232,6 +1359,7 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
             "camera_startup_check_s": float(config["camera_startup_check_s"]),
             "camera_stop_timeout_s": float(config["camera_stop_timeout_s"]),
         },
+        "audio": audio_resolution,
         "camera": {"conflicts": None, "audio_started": False},
         "storage": {"before": None, "after": None},
         "segments": [],
@@ -1249,6 +1377,12 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
         append_log(log_file, f"External storage used: {external_storage_used}")
         for warning in config_warnings:
             append_log(log_file, f"CONFIG WARNING: {warning}")
+
+        audio_resolution = resolve_audio_device(config, log_file)
+        metadata["audio"] = audio_resolution
+        metadata["settings"]["audio_device"] = str(config["audio_device"])
+        append_log(log_file, f"Audio device requested: {audio_resolution.get('requested')}")
+        append_log(log_file, f"Audio device selected: {audio_resolution.get('selected')}")
 
         storage_t0 = time.monotonic()
         storage_before = check_storage_or_fail(media_dir, float(config["max_storage_percent"]))
@@ -1353,7 +1487,7 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
                 write_status_files(status_dir, metadata, status, error_message)
             except Exception as status_exc:
                 append_log(log_file, f"WARNING: failed to rewrite status files after power control: {status_exc}")
-            sync_filesystem()
+            sync_filesystem(log_file)
         except Exception as power_exc:
             append_log(log_file, f"POWER ERROR: unexpected failure: {power_exc}")
             metadata["power"] = {"enabled": bool(config.get("power_control_enabled", False)), "error": str(power_exc)}
@@ -1368,7 +1502,7 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Poracam v0.7: config.txt simplificado + controle de energia via Witty Pi."
+        description="Poracam v0.7.1: config.txt simplificado + controle de energia via Witty Pi."
     )
 
     parser.add_argument(
@@ -1390,7 +1524,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     # Developer/installation flags. Not intended for the end-user config.txt.
     parser.add_argument("--power-control", action="store_true", help="Ativa agendamento Witty Pi + shutdown ao final da gravação.")
-    parser.add_argument("--no-power-control", action="store_true", help="Desativa controle de energia, mesmo na v0.7.")
+    parser.add_argument("--no-power-control", action="store_true", help="Desativa controle de energia, mesmo na v0.7.1.")
     parser.add_argument("--power-dry-run", action="store_true", help="Simula agendamento/shutdown sem escrever no Witty Pi nem desligar.")
     parser.add_argument("--wittypi-dir", default=None, help="Diretório do Witty Pi contendo utilities.sh.")
 
