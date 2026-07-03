@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-poracam_record.py — Poracam v0.6.1
+poracam_record.py — Poracam v0.6.2
 
-Novidades da v0.6:
+Novidades da v0.6.2:
 - Procura armazenamento externo com PORACAM/config.txt em /media/*/* e /mnt/*.
 - Se encontrar config externo, usa esse config e salva em PORACAM/media quando media_dir não estiver definido.
 - Mantém fallback local.
 - Cria arquivos de status em PORACAM/status ou no diretório pai de media/.
-- Mantém lógica validada: vídeo MP4 final, áudio WAV separado, H264 temporário apagado.
+- Mantém a lógica validada: vídeo MP4 final, áudio WAV separado, H264 temporário apagado.
 """
 
 import argparse
@@ -17,6 +17,7 @@ import glob
 import json
 import os
 import shutil
+import re
 import signal
 import subprocess
 import sys
@@ -25,50 +26,101 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 PROJECT_NAME = "poracam"
-PROJECT_VERSION = "0.6.1"
+PROJECT_VERSION = "0.6.2"
 
-DEFAULT_CONFIG: Dict[str, Any] = {
-    "duration": 60,
-    "segment_duration_s": 600,
-    "enable_segment_split": True,
-    "cycle_period_s": 300,
-    "run_mode": "single",
-    "media_dir": "/home/fishcam/poracam/media",
-    "width": 1280,
-    "height": 720,
-    "fps": 30,
-    "bitrate": 2500000,
-    "audio_device": "default",
-    "audio_format": "cd",
-    "keep_h264": False,
-    "start_delay": 0.2,
-    "extra_timeout": 15.0,
-    "max_storage_percent": 95.0,
-    "prefer_external_storage": True,
-    "allow_local_fallback": True,
-    "camera_conflict_policy": "stop_known_processes",
-    "camera_startup_check_s": 1.0,
-    "camera_stop_timeout_s": 5.0,
+# ============================================================
+# Developer/internal configuration
+# ============================================================
+# These parameters are intentionally not exposed in the user config.txt.
+# The user-facing configuration should remain simple and robust.
+
+DEFAULT_SESSION_NAME = "fishcam"
+
+MAX_RECORD_DURATION_PER_SEGMENT_S = 600  # 10 minutes per file
+ENABLE_SEGMENT_SPLIT = True
+
+DEFAULT_MEDIA_DIR = "/home/fishcam/poracam/media"
+MAX_STORAGE_PERCENT = 95.0
+
+AUDIO_DEVICE = "default"
+AUDIO_FORMAT = "cd"
+
+KEEP_H264 = False
+
+CAMERA_CONFLICT_POLICY = "stop_known_processes"
+CAMERA_STARTUP_CHECK_S = 0.5
+CAMERA_STOP_TIMEOUT_S = 5.0
+
+START_DELAY_S = 0.1
+EXTRA_TIMEOUT_S = 60.0
+
+VIDEO_PROFILES: Dict[str, Dict[str, int]] = {
+    # Lower storage use and lighter processing.
+    "low": {
+        "width": 1280,
+        "height": 720,
+        "fps": 20,
+        "bitrate": 2500000,
+    },
+    # 1080p with reduced frame rate/bitrate for a compromise between image and autonomy.
+    "balanced": {
+        "width": 1920,
+        "height": 1080,
+        "fps": 20,
+        "bitrate": 3500000,
+    },
+    # Validated 1080p profile with better image quality.
+    "high": {
+        "width": 1920,
+        "height": 1080,
+        "fps": 25,
+        "bitrate": 4000000,
+    },
 }
 
+DEFAULT_CONFIG: Dict[str, Any] = {
+    # User-facing fields
+    "session_name": DEFAULT_SESSION_NAME,
+    "record_duration_min": 1.0,
+    "cycle_period_min": 5.0,
+    "video_quality": "high",
+
+    # Runtime fields derived from user-facing fields
+    "duration": 60,
+    "cycle_period_s": 300,
+    "segment_duration_s": MAX_RECORD_DURATION_PER_SEGMENT_S,
+    "enable_segment_split": ENABLE_SEGMENT_SPLIT,
+
+    # Internal/developer fields
+    "run_mode": "single",
+    "media_dir": DEFAULT_MEDIA_DIR,
+    "width": VIDEO_PROFILES["high"]["width"],
+    "height": VIDEO_PROFILES["high"]["height"],
+    "fps": VIDEO_PROFILES["high"]["fps"],
+    "bitrate": VIDEO_PROFILES["high"]["bitrate"],
+    "audio_device": AUDIO_DEVICE,
+    "audio_format": AUDIO_FORMAT,
+    "keep_h264": KEEP_H264,
+    "start_delay": START_DELAY_S,
+    "extra_timeout": EXTRA_TIMEOUT_S,
+    "max_storage_percent": MAX_STORAGE_PERCENT,
+    "prefer_external_storage": True,
+    "allow_local_fallback": True,
+    "camera_conflict_policy": CAMERA_CONFLICT_POLICY,
+    "camera_startup_check_s": CAMERA_STARTUP_CHECK_S,
+    "camera_stop_timeout_s": CAMERA_STOP_TIMEOUT_S,
+}
+
+# User-facing keys accepted in config.txt.
+# Technical parameters are intentionally not accepted from config.txt in v0.6.2.
 CONFIG_KEY_ALIASES = {
-    "record_duration_s": "duration", "duration_s": "duration", "duration": "duration",
-    "segment_duration_s": "segment_duration_s", "max_segment_duration_s": "segment_duration_s", "split_duration_s": "segment_duration_s",
-    "enable_segment_split": "enable_segment_split", "segment_split_enabled": "enable_segment_split",
-    "cycle_period_s": "cycle_period_s", "cycle_s": "cycle_period_s", "period_s": "cycle_period_s",
-    "run_mode": "run_mode", "mode": "run_mode",
-    "media_dir": "media_dir", "output_dir": "media_dir",
-    "width": "width", "height": "height", "fps": "fps", "bitrate": "bitrate",
-    "audio_device": "audio_device", "audio_format": "audio_format",
-    "keep_h264": "keep_h264", "delete_h264_after_mp4": "delete_h264_after_mp4",
-    "start_delay": "start_delay", "start_delay_s": "start_delay",
-    "extra_timeout": "extra_timeout", "extra_timeout_s": "extra_timeout",
-    "max_storage_percent": "max_storage_percent", "storage_max_percent": "max_storage_percent",
-    "prefer_external_storage": "prefer_external_storage",
-    "allow_local_fallback": "allow_local_fallback",
-    "camera_conflict_policy": "camera_conflict_policy",
-    "camera_startup_check_s": "camera_startup_check_s",
-    "camera_stop_timeout_s": "camera_stop_timeout_s",
+    "session_name": "session_name",
+    "record_duration_min": "record_duration_min",
+    "record_minutes": "record_duration_min",
+    "cycle_period_min": "cycle_period_min",
+    "cycle_minutes": "cycle_period_min",
+    "video_quality": "video_quality",
+    "quality": "video_quality",
 }
 
 
@@ -108,14 +160,16 @@ def parse_bool(value: str) -> bool:
 
 def parse_value(key: str, raw_value: str) -> Any:
     value = raw_value.strip()
-    if key in ("duration", "segment_duration_s", "cycle_period_s", "width", "height", "fps", "bitrate"):
-        return int(value)
-    if key in ("start_delay", "extra_timeout", "max_storage_percent", "camera_startup_check_s", "camera_stop_timeout_s"):
-        return float(value)
-    if key in ("keep_h264", "delete_h264_after_mp4", "prefer_external_storage", "allow_local_fallback"):
-        return parse_bool(value)
-    if key in ("run_mode", "camera_conflict_policy"):
+
+    if key in ("record_duration_min", "cycle_period_min"):
+        return float(value.replace(",", "."))
+
+    if key == "video_quality":
         return value.strip().lower()
+
+    if key == "session_name":
+        return value.strip()
+
     return value
 
 
@@ -209,42 +263,125 @@ def load_config_file(path: Optional[Path]) -> Tuple[Dict[str, Any], Optional[str
     return config, str(path), warnings, media_dir_was_defined
 
 
+
+def sanitize_session_name(value: str) -> str:
+    """
+    Sanitizes the session/campaign name for filenames.
+
+    Keeps only ASCII letters, numbers, '-' and '_'.
+    Empty values fall back to DEFAULT_SESSION_NAME.
+    """
+    raw = str(value or "").strip()
+    sanitized = re.sub(r"[^A-Za-z0-9_-]+", "_", raw)
+    sanitized = sanitized.strip("_-")
+    if not sanitized:
+        sanitized = DEFAULT_SESSION_NAME
+    return sanitized[:40]
+
+
+def minutes_to_seconds(value: float, field_name: str) -> int:
+    if value <= 0:
+        raise ValueError(f"{field_name} precisa ser maior que zero.")
+    return int(round(value * 60.0))
+
+
+def apply_user_config_to_runtime(config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Converts the simplified user-facing config into the internal runtime config.
+    """
+    session_name = sanitize_session_name(str(config.get("session_name", DEFAULT_SESSION_NAME)))
+
+    record_duration_min = float(config.get("record_duration_min", 1.0))
+    cycle_period_min = float(config.get("cycle_period_min", 5.0))
+    video_quality = str(config.get("video_quality", "high")).strip().lower()
+
+    if video_quality not in VIDEO_PROFILES:
+        raise ValueError(
+            "video_quality precisa ser uma das opções: "
+            + ", ".join(sorted(VIDEO_PROFILES.keys()))
+            + f". Recebido: {video_quality}"
+        )
+
+    duration_s = minutes_to_seconds(record_duration_min, "record_duration_min")
+    cycle_period_s = minutes_to_seconds(cycle_period_min, "cycle_period_min")
+
+    if cycle_period_s <= duration_s:
+        raise ValueError(
+            "cycle_period_min precisa ser maior que record_duration_min para haver "
+            "tempo de processamento, desligamento e economia de energia. "
+            f"Recebido: record_duration_min={record_duration_min}, "
+            f"cycle_period_min={cycle_period_min}"
+        )
+
+    profile = VIDEO_PROFILES[video_quality]
+
+    config["session_name"] = session_name
+    config["record_duration_min"] = record_duration_min
+    config["cycle_period_min"] = cycle_period_min
+    config["video_quality"] = video_quality
+
+    config["duration"] = duration_s
+    config["cycle_period_s"] = cycle_period_s
+
+    config["segment_duration_s"] = MAX_RECORD_DURATION_PER_SEGMENT_S
+    config["enable_segment_split"] = ENABLE_SEGMENT_SPLIT
+
+    config["width"] = int(profile["width"])
+    config["height"] = int(profile["height"])
+    config["fps"] = int(profile["fps"])
+    config["bitrate"] = int(profile["bitrate"])
+
+    # Re-assert internal/developer constants so they cannot be changed from config.txt.
+    config["run_mode"] = "single"
+    config["audio_device"] = AUDIO_DEVICE
+    config["audio_format"] = AUDIO_FORMAT
+    config["keep_h264"] = KEEP_H264
+    config["start_delay"] = START_DELAY_S
+    config["extra_timeout"] = EXTRA_TIMEOUT_S
+    config["max_storage_percent"] = MAX_STORAGE_PERCENT
+    config["prefer_external_storage"] = True
+    config["allow_local_fallback"] = True
+    config["camera_conflict_policy"] = CAMERA_CONFLICT_POLICY
+    config["camera_startup_check_s"] = CAMERA_STARTUP_CHECK_S
+    config["camera_stop_timeout_s"] = CAMERA_STOP_TIMEOUT_S
+
+    return config
+
+
 def merge_config(args: argparse.Namespace) -> Tuple[Dict[str, Any], Optional[str], str, bool, List[str]]:
     final_config = dict(DEFAULT_CONFIG)
     config_path, source_type, external_used, warnings = determine_config_path(args)
-    file_config, config_source, file_warnings, media_dir_was_defined = load_config_file(config_path)
+
+    file_config, config_source, file_warnings, _media_dir_was_defined = load_config_file(config_path)
     warnings.extend(file_warnings)
     final_config.update(file_config)
-    if external_used and config_path is not None and not media_dir_was_defined:
-        poracam_root = config_path.parent
-        final_config["media_dir"] = str(poracam_root / "media")
-        warnings.append(f"media_dir não definido no config externo; usando automaticamente {final_config['media_dir']}")
+
+    # User-facing CLI overrides, useful for developer tests.
     cli_overrides = {
-        "duration": args.duration,
-        "segment_duration_s": args.segment_duration_s,
-        "enable_segment_split": args.enable_segment_split,
-        "cycle_period_s": args.cycle_period_s,
-        "run_mode": args.run_mode,
-        "media_dir": args.media_dir,
-        "width": args.width,
-        "height": args.height,
-        "fps": args.fps,
-        "bitrate": args.bitrate,
-        "audio_device": args.audio_device,
-        "audio_format": args.audio_format,
-        "keep_h264": args.keep_h264,
-        "start_delay": args.start_delay,
-        "extra_timeout": args.extra_timeout,
-        "max_storage_percent": args.max_storage_percent,
-        "prefer_external_storage": False if args.ignore_external_storage else None,
-        "allow_local_fallback": args.allow_local_fallback,
-        "camera_conflict_policy": args.camera_conflict_policy,
-        "camera_startup_check_s": args.camera_startup_check_s,
-        "camera_stop_timeout_s": args.camera_stop_timeout_s,
+        "session_name": args.session_name,
+        "record_duration_min": args.record_duration_min,
+        "cycle_period_min": args.cycle_period_min,
+        "video_quality": args.video_quality,
     }
     for key, value in cli_overrides.items():
         if value is not None:
-            final_config[key] = str(value).lower() if key == "run_mode" else value
+            final_config[key] = value
+
+    final_config = apply_user_config_to_runtime(final_config)
+
+    # Storage path is not exposed to the user:
+    # external config -> use PORACAM/media on that device;
+    # local config/default -> use internal DEFAULT_MEDIA_DIR.
+    if external_used and config_path is not None:
+        poracam_root = config_path.parent
+        final_config["media_dir"] = str(poracam_root / "media")
+        warnings.append(f"armazenamento externo detectado; usando automaticamente {final_config['media_dir']}")
+    else:
+        final_config["media_dir"] = DEFAULT_MEDIA_DIR
+
+    if args.ignore_external_storage:
+        final_config["prefer_external_storage"] = False
+
     return final_config, config_source, source_type, external_used, warnings
 
 
@@ -459,7 +596,7 @@ def validate_config(config: Dict[str, Any]) -> None:
     if int(config["cycle_period_s"]) < int(config["duration"]):
         raise ValueError(f"cycle_period_s precisa ser maior ou igual a record_duration_s/duration. Recebido: cycle_period_s={config['cycle_period_s']}, duration={config['duration']}")
     if str(config["run_mode"]).lower() != "single":
-        raise ValueError(f"Na v0.6.1, apenas run_mode=single é suportado. Recebido: run_mode={config['run_mode']}")
+        raise ValueError(f"Na v0.6.2, apenas run_mode=single é suportado. Recebido: run_mode={config['run_mode']}")
     for key in ("width", "height", "fps", "bitrate"):
         if int(config[key]) <= 0:
             raise ValueError(f"{key} precisa ser maior que zero.")
@@ -748,7 +885,9 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
     validate_config(config)
     total_t0 = time.monotonic()
     start_iso = iso_now()
-    stamp = now_stamp()
+    stamp_base = now_stamp()
+    session_name = str(config.get("session_name", DEFAULT_SESSION_NAME))
+    stamp = f"{stamp_base}_{session_name}" if session_name else stamp_base
     duration = int(config["duration"])
     segment_duration = int(config["segment_duration_s"])
     enable_segment_split = bool(config["enable_segment_split"])
@@ -812,6 +951,10 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
             "metadata": str(metadata_file),
         },
         "settings": {
+            "session_name": str(config.get("session_name", DEFAULT_SESSION_NAME)),
+            "record_duration_min": float(config.get("record_duration_min", duration / 60.0)),
+            "cycle_period_min": float(config.get("cycle_period_min", int(config["cycle_period_s"]) / 60.0)),
+            "video_quality": str(config.get("video_quality", "high")),
             "run_mode": str(config["run_mode"]),
             "duration": duration,
             "segment_duration_s": segment_duration,
@@ -952,29 +1095,27 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Poracam v0.6.1: gravação MP4/WAV com proteção contra câmera ocupada.")
-    parser.add_argument("--config", default=None, help="Caminho para o config.txt. Se omitido, procura armazenamento externo e fallback local.")
-    parser.add_argument("--ignore-external-storage", action="store_true", help="Ignora busca por /media/*/*/PORACAM/config.txt e /mnt/*/PORACAM/config.txt.")
-    parser.add_argument("--allow-local-fallback", action="store_true", default=None, help="Permite fallback local. Campo reservado para uso futuro.")
-    parser.add_argument("--duration", type=int, default=None, help="Duração da gravação em segundos.")
-    parser.add_argument("--cycle-period-s", type=int, default=None, help="Período total do ciclo em segundos.")
-    parser.add_argument("--segment-duration-s", type=int, default=None, help="Duração máxima de cada segmento, em segundos.")
-    parser.add_argument("--enable-segment-split", action="store_true", default=None, help="Habilita divisão da gravação em segmentos.")
-    parser.add_argument("--run-mode", default=None, help="Modo de execução. Na v0.5, apenas 'single' é suportado.")
-    parser.add_argument("--media-dir", default=None, help="Diretório base para salvar mídia, logs e metadados.")
-    parser.add_argument("--width", type=int, default=None, help="Largura do vídeo.")
-    parser.add_argument("--height", type=int, default=None, help="Altura do vídeo.")
-    parser.add_argument("--fps", type=int, default=None, help="Frames por segundo.")
-    parser.add_argument("--bitrate", type=int, default=None, help="Bitrate do vídeo em bits/s.")
-    parser.add_argument("--audio-device", default=None, help="Dispositivo ALSA para áudio. Exemplo: default, plughw:1,0.")
-    parser.add_argument("--audio-format", default=None, help="Formato do arecord. Exemplo: cd, S16_LE.")
-    parser.add_argument("--start-delay", type=float, default=None, help="Atraso entre início do áudio e início do vídeo.")
-    parser.add_argument("--extra-timeout", type=float, default=None, help="Tempo extra para aguardar processos finalizarem.")
-    parser.add_argument("--max-storage-percent", type=float, default=None, help="Uso máximo permitido do armazenamento, em porcentagem.")
-    parser.add_argument("--camera-conflict-policy", default=None, help="error_only, stop_known_processes ou ignore.")
-    parser.add_argument("--camera-startup-check-s", type=float, default=None, help="Tempo para verificar se raspivid falha logo no início.")
-    parser.add_argument("--camera-stop-timeout-s", type=float, default=None, help="Tempo para tentar parar processos conhecidos da câmera.")
-    parser.add_argument("--keep-h264", action="store_true", default=None, help="Mantém o arquivo .h264 temporário após gerar o MP4.")
+    parser = argparse.ArgumentParser(
+        description="Poracam v0.6.2: config.txt simplificado para usuário final."
+    )
+
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="Caminho para o config.txt. Se omitido, procura armazenamento externo e fallback local.",
+    )
+    parser.add_argument(
+        "--ignore-external-storage",
+        action="store_true",
+        help="Ignora busca por /media/*/*/PORACAM/config.txt e /mnt/*/PORACAM/config.txt.",
+    )
+
+    # User-facing developer test overrides.
+    parser.add_argument("--session-name", default=None, help="Nome da campanha/sessão.")
+    parser.add_argument("--record-duration-min", type=float, default=None, help="Tempo de gravação por ciclo, em minutos.")
+    parser.add_argument("--cycle-period-min", type=float, default=None, help="Período entre inícios de gravação, em minutos.")
+    parser.add_argument("--video-quality", default=None, help="Perfil de vídeo: low, balanced ou high.")
+
     parser.add_argument("--version", action="version", version=f"Poracam {PROJECT_VERSION}")
     return parser
 
