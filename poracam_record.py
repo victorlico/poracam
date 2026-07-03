@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-poracam_record.py — Poracam v0.6.2
+poracam_record.py — Poracam v0.7
 
-Novidades da v0.6.2:
+Novidades da v0.7:
 - Procura armazenamento externo com PORACAM/config.txt em /media/*/* e /mnt/*.
 - Se encontrar config externo, usa esse config e salva em PORACAM/media quando media_dir não estiver definido.
 - Mantém fallback local.
@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 PROJECT_NAME = "poracam"
-PROJECT_VERSION = "0.6.2"
+PROJECT_VERSION = "0.7"
 
 # ============================================================
 # Developer/internal configuration
@@ -53,6 +53,18 @@ CAMERA_STOP_TIMEOUT_S = 5.0
 
 START_DELAY_S = 0.1
 EXTRA_TIMEOUT_S = 60.0
+
+# Witty Pi power-control integration.
+# Kept out of config.txt: the user still edits only recording time, cycle period and video quality.
+WITTYPI_POWER_CONTROL_ENABLED_BY_DEFAULT = False  # enabled by --power-control, used by afterStartup wrapper
+WITTYPI_DIR_CANDIDATES = [
+    "/home/fishcam/wittypi",
+    "/home/pi/wittypi",
+]
+WITTYPI_POWER_SCRIPT_NAME = "poracam_wittypi_power.sh"
+MINIMUM_OFF_TIME_S = 60
+SHUTDOWN_DELAY_S = 10
+REQUIRE_STARTUP_SCHEDULE_BEFORE_SHUTDOWN = True
 
 VIDEO_PROFILES: Dict[str, Dict[str, int]] = {
     # Lower storage use and lighter processing.
@@ -106,13 +118,21 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "max_storage_percent": MAX_STORAGE_PERCENT,
     "prefer_external_storage": True,
     "allow_local_fallback": True,
+    "power_control_enabled": WITTYPI_POWER_CONTROL_ENABLED_BY_DEFAULT,
+    "power_dry_run": False,
+    "shutdown_after_recording": True,
+    "minimum_off_time_s": MINIMUM_OFF_TIME_S,
+    "shutdown_delay_s": SHUTDOWN_DELAY_S,
+    "require_startup_schedule_before_shutdown": REQUIRE_STARTUP_SCHEDULE_BEFORE_SHUTDOWN,
+    "wittypi_dir": "",
+    "wittypi_power_script": "",
     "camera_conflict_policy": CAMERA_CONFLICT_POLICY,
     "camera_startup_check_s": CAMERA_STARTUP_CHECK_S,
     "camera_stop_timeout_s": CAMERA_STOP_TIMEOUT_S,
 }
 
 # User-facing keys accepted in config.txt.
-# Technical parameters are intentionally not accepted from config.txt in v0.6.2.
+# Technical parameters are intentionally not accepted from config.txt in v0.7.
 CONFIG_KEY_ALIASES = {
     "session_name": "session_name",
     "record_duration_min": "record_duration_min",
@@ -341,6 +361,9 @@ def apply_user_config_to_runtime(config: Dict[str, Any]) -> Dict[str, Any]:
     config["max_storage_percent"] = MAX_STORAGE_PERCENT
     config["prefer_external_storage"] = True
     config["allow_local_fallback"] = True
+    config["minimum_off_time_s"] = MINIMUM_OFF_TIME_S
+    config["shutdown_delay_s"] = SHUTDOWN_DELAY_S
+    config["require_startup_schedule_before_shutdown"] = REQUIRE_STARTUP_SCHEDULE_BEFORE_SHUTDOWN
     config["camera_conflict_policy"] = CAMERA_CONFLICT_POLICY
     config["camera_startup_check_s"] = CAMERA_STARTUP_CHECK_S
     config["camera_stop_timeout_s"] = CAMERA_STOP_TIMEOUT_S
@@ -381,6 +404,18 @@ def merge_config(args: argparse.Namespace) -> Tuple[Dict[str, Any], Optional[str
 
     if args.ignore_external_storage:
         final_config["prefer_external_storage"] = False
+
+    # Power control is intentionally not user-facing in config.txt.
+    # It is enabled by the Witty Pi afterStartup wrapper using --power-control.
+    if args.power_control:
+        final_config["power_control_enabled"] = True
+    if args.no_power_control:
+        final_config["power_control_enabled"] = False
+    if args.power_dry_run:
+        final_config["power_dry_run"] = True
+        final_config["power_control_enabled"] = True
+    if args.wittypi_dir:
+        final_config["wittypi_dir"] = args.wittypi_dir
 
     return final_config, config_source, source_type, external_used, warnings
 
@@ -596,7 +631,7 @@ def validate_config(config: Dict[str, Any]) -> None:
     if int(config["cycle_period_s"]) < int(config["duration"]):
         raise ValueError(f"cycle_period_s precisa ser maior ou igual a record_duration_s/duration. Recebido: cycle_period_s={config['cycle_period_s']}, duration={config['duration']}")
     if str(config["run_mode"]).lower() != "single":
-        raise ValueError(f"Na v0.6.2, apenas run_mode=single é suportado. Recebido: run_mode={config['run_mode']}")
+        raise ValueError(f"Na v0.7, apenas run_mode=single é suportado. Recebido: run_mode={config['run_mode']}")
     for key in ("width", "height", "fps", "bitrate"):
         if int(config[key]) <= 0:
             raise ValueError(f"{key} precisa ser maior que zero.")
@@ -881,10 +916,224 @@ def record_one_segment(
     return result
 
 
+
+def find_wittypi_dir(config: Dict[str, Any]) -> Optional[Path]:
+    configured = str(config.get("wittypi_dir") or "").strip()
+    candidates: List[str] = []
+    if configured:
+        candidates.append(configured)
+    candidates.extend(WITTYPI_DIR_CANDIDATES)
+
+    for candidate in candidates:
+        path = Path(candidate).expanduser().resolve()
+        if (path / "utilities.sh").exists():
+            return path
+    return None
+
+
+def find_power_script() -> Optional[Path]:
+    """
+    Locate the Bash wrapper used to interact with Witty Pi utilities.sh.
+
+    The normal installation places poracam_wittypi_power.sh next to this Python file.
+    """
+    here = Path(__file__).resolve().parent
+    candidate = here / WITTYPI_POWER_SCRIPT_NAME
+    if candidate.exists():
+        return candidate
+    fallback = Path("/home/fishcam/poracam") / WITTYPI_POWER_SCRIPT_NAME
+    if fallback.exists():
+        return fallback
+    return None
+
+
+def compute_next_cycle_start_epoch(start_epoch: int, cycle_period_s: int, minimum_off_time_s: int, now_epoch: Optional[int] = None) -> int:
+    """
+    cycle_period_s is interpreted as the period between recording starts.
+
+    The next startup target is start_epoch + N*cycle_period_s, advanced until it is
+    at least now + minimum_off_time_s. This preserves fixed-period sampling when
+    processing time varies.
+    """
+    if now_epoch is None:
+        now_epoch = int(time.time())
+
+    if cycle_period_s <= 0:
+        raise ValueError("cycle_period_s precisa ser maior que zero.")
+    if minimum_off_time_s < 0:
+        minimum_off_time_s = 0
+
+    target = int(start_epoch) + int(cycle_period_s)
+    min_target = int(now_epoch) + int(minimum_off_time_s)
+
+    while target < min_target:
+        target += int(cycle_period_s)
+
+    return target
+
+
+def epoch_to_local_iso(epoch: int) -> str:
+    return dt.datetime.fromtimestamp(int(epoch)).astimezone().isoformat(timespec="seconds")
+
+
+def run_power_wrapper(
+    action: str,
+    target_epoch: Optional[int],
+    wittypi_dir: Optional[Path],
+    dry_run: bool,
+    log_file: Path,
+) -> Dict[str, Any]:
+    script = find_power_script()
+    result: Dict[str, Any] = {
+        "action": action,
+        "ok": False,
+        "dry_run": dry_run,
+        "script": str(script) if script else None,
+        "wittypi_dir": str(wittypi_dir) if wittypi_dir else None,
+        "target_epoch": target_epoch,
+        "target_time": epoch_to_local_iso(target_epoch) if target_epoch else None,
+        "returncode": None,
+        "stdout": "",
+        "stderr": "",
+        "error": None,
+    }
+
+    if script is None:
+        result["error"] = f"{WITTYPI_POWER_SCRIPT_NAME} não encontrado ao lado do poracam_record.py."
+        append_log(log_file, f"POWER ERROR: {result['error']}")
+        return result
+
+    if wittypi_dir is None:
+        result["error"] = "Diretório do Witty Pi com utilities.sh não encontrado."
+        append_log(log_file, f"POWER ERROR: {result['error']}")
+        return result
+
+    cmd = [str(script), action, "--wittypi-dir", str(wittypi_dir)]
+    if target_epoch is not None:
+        cmd.extend(["--target-epoch", str(int(target_epoch))])
+    if dry_run:
+        cmd.append("--dry-run")
+
+    append_log(log_file, f"POWER command: {' '.join(cmd)}")
+
+    try:
+        proc = subprocess.run(cmd, text=True, capture_output=True, timeout=60)
+        result["returncode"] = proc.returncode
+        result["stdout"] = proc.stdout.strip()
+        result["stderr"] = proc.stderr.strip()
+        result["ok"] = proc.returncode == 0
+        if result["stdout"]:
+            append_log(log_file, f"POWER stdout: {result['stdout']}")
+        if result["stderr"]:
+            append_log(log_file, f"POWER stderr: {result['stderr']}")
+        if not result["ok"]:
+            result["error"] = f"wrapper retornou código {proc.returncode}"
+            append_log(log_file, f"POWER ERROR: {result['error']}")
+    except Exception as exc:
+        result["error"] = str(exc)
+        append_log(log_file, f"POWER ERROR: {result['error']}")
+
+    return result
+
+
+def perform_power_control(
+    config: Dict[str, Any],
+    status: str,
+    recording_start_epoch: int,
+    log_file: Path,
+) -> Dict[str, Any]:
+    """
+    Schedule next Witty Pi startup and optionally request shutdown.
+
+    The next startup is based on recording_start_epoch + cycle_period_s, not on
+    end-of-processing time.
+    """
+    enabled = bool(config.get("power_control_enabled", False))
+    dry_run = bool(config.get("power_dry_run", False))
+    shutdown_after_recording = bool(config.get("shutdown_after_recording", True))
+    cycle_period_s = int(config["cycle_period_s"])
+    minimum_off_time_s = int(config.get("minimum_off_time_s", MINIMUM_OFF_TIME_S))
+    shutdown_delay_s = int(config.get("shutdown_delay_s", SHUTDOWN_DELAY_S))
+    require_schedule = bool(config.get("require_startup_schedule_before_shutdown", True))
+
+    now_epoch = int(time.time())
+    target_epoch = compute_next_cycle_start_epoch(
+        start_epoch=recording_start_epoch,
+        cycle_period_s=cycle_period_s,
+        minimum_off_time_s=minimum_off_time_s,
+        now_epoch=now_epoch,
+    )
+
+    wittypi_dir = find_wittypi_dir(config)
+
+    power: Dict[str, Any] = {
+        "enabled": enabled,
+        "dry_run": dry_run,
+        "shutdown_after_recording": shutdown_after_recording,
+        "status_when_called": status,
+        "recording_start_epoch": int(recording_start_epoch),
+        "recording_start_time": epoch_to_local_iso(recording_start_epoch),
+        "now_epoch": now_epoch,
+        "now_time": epoch_to_local_iso(now_epoch),
+        "cycle_period_s": cycle_period_s,
+        "minimum_off_time_s": minimum_off_time_s,
+        "shutdown_delay_s": shutdown_delay_s,
+        "next_startup_epoch": target_epoch,
+        "next_startup_time": epoch_to_local_iso(target_epoch),
+        "wittypi_dir": str(wittypi_dir) if wittypi_dir else None,
+        "schedule_result": None,
+        "shutdown_result": None,
+        "shutdown_requested": False,
+        "shutdown_skipped_reason": None,
+    }
+
+    if not enabled:
+        power["shutdown_skipped_reason"] = "power_control_disabled"
+        append_log(log_file, "POWER: disabled; not scheduling startup or shutdown.")
+        return power
+
+    schedule_result = run_power_wrapper(
+        action="schedule-startup",
+        target_epoch=target_epoch,
+        wittypi_dir=wittypi_dir,
+        dry_run=dry_run,
+        log_file=log_file,
+    )
+    power["schedule_result"] = schedule_result
+
+    if not shutdown_after_recording:
+        power["shutdown_skipped_reason"] = "shutdown_after_recording_false"
+        return power
+
+    if require_schedule and not schedule_result.get("ok"):
+        power["shutdown_skipped_reason"] = "startup_schedule_failed"
+        append_log(log_file, "POWER: startup schedule failed; shutdown skipped to avoid losing recovery.")
+        return power
+
+    if shutdown_delay_s > 0:
+        append_log(log_file, f"POWER: waiting {shutdown_delay_s}s before shutdown request.")
+        time.sleep(shutdown_delay_s)
+
+    shutdown_result = run_power_wrapper(
+        action="shutdown",
+        target_epoch=None,
+        wittypi_dir=wittypi_dir,
+        dry_run=dry_run,
+        log_file=log_file,
+    )
+    power["shutdown_result"] = shutdown_result
+    power["shutdown_requested"] = bool(shutdown_result.get("ok"))
+    if not power["shutdown_requested"]:
+        power["shutdown_skipped_reason"] = "shutdown_wrapper_failed"
+
+    return power
+
+
 def record(config: Dict[str, Any], config_source: Optional[str], config_source_type: str, external_storage_used: bool, config_warnings: List[str]) -> int:
     validate_config(config)
     total_t0 = time.monotonic()
     start_iso = iso_now()
+    start_epoch = int(time.time())
     stamp_base = now_stamp()
     session_name = str(config.get("session_name", DEFAULT_SESSION_NAME))
     stamp = f"{stamp_base}_{session_name}" if session_name else stamp_base
@@ -975,6 +1224,10 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
             "max_storage_percent": float(config["max_storage_percent"]),
             "prefer_external_storage": bool(config["prefer_external_storage"]),
             "allow_local_fallback": bool(config["allow_local_fallback"]),
+            "power_control_enabled": bool(config.get("power_control_enabled", False)),
+            "power_dry_run": bool(config.get("power_dry_run", False)),
+            "minimum_off_time_s": int(config.get("minimum_off_time_s", MINIMUM_OFF_TIME_S)),
+            "shutdown_delay_s": int(config.get("shutdown_delay_s", SHUTDOWN_DELAY_S)),
             "camera_conflict_policy": str(config["camera_conflict_policy"]),
             "camera_startup_check_s": float(config["camera_startup_check_s"]),
             "camera_stop_timeout_s": float(config["camera_stop_timeout_s"]),
@@ -985,6 +1238,7 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
         "timing": timing,
         "files": {},
         "h264_deleted": None,
+        "power": None,
         "error": None,
     }
 
@@ -1088,6 +1342,24 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
             write_status_files(status_dir, metadata, status, error_message)
         except Exception as status_exc:
             append_log(log_file, f"WARNING: failed to write status files: {status_exc}")
+
+        # Power control is done only after media, metadata and status are safely written.
+        try:
+            power_info = perform_power_control(config, status, start_epoch, log_file)
+            metadata["power"] = power_info
+            with metadata_file.open("w", encoding="utf-8") as f:
+                json.dump(metadata, f, indent=2, ensure_ascii=False)
+            try:
+                write_status_files(status_dir, metadata, status, error_message)
+            except Exception as status_exc:
+                append_log(log_file, f"WARNING: failed to rewrite status files after power control: {status_exc}")
+            sync_filesystem()
+        except Exception as power_exc:
+            append_log(log_file, f"POWER ERROR: unexpected failure: {power_exc}")
+            metadata["power"] = {"enabled": bool(config.get("power_control_enabled", False)), "error": str(power_exc)}
+            with metadata_file.open("w", encoding="utf-8") as f:
+                json.dump(metadata, f, indent=2, ensure_ascii=False)
+
         append_log(log_file, f"Metadata saved: {metadata_file}")
         append_log(log_file, f"Final status: {status}")
         append_log(log_file, f"Total elapsed: {timing['total_s']} s")
@@ -1096,7 +1368,7 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Poracam v0.6.2: config.txt simplificado para usuário final."
+        description="Poracam v0.7: config.txt simplificado + controle de energia via Witty Pi."
     )
 
     parser.add_argument(
@@ -1115,6 +1387,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--record-duration-min", type=float, default=None, help="Tempo de gravação por ciclo, em minutos.")
     parser.add_argument("--cycle-period-min", type=float, default=None, help="Período entre inícios de gravação, em minutos.")
     parser.add_argument("--video-quality", default=None, help="Perfil de vídeo: low, balanced ou high.")
+
+    # Developer/installation flags. Not intended for the end-user config.txt.
+    parser.add_argument("--power-control", action="store_true", help="Ativa agendamento Witty Pi + shutdown ao final da gravação.")
+    parser.add_argument("--no-power-control", action="store_true", help="Desativa controle de energia, mesmo na v0.7.")
+    parser.add_argument("--power-dry-run", action="store_true", help="Simula agendamento/shutdown sem escrever no Witty Pi nem desligar.")
+    parser.add_argument("--wittypi-dir", default=None, help="Diretório do Witty Pi contendo utilities.sh.")
 
     parser.add_argument("--version", action="version", version=f"Poracam {PROJECT_VERSION}")
     return parser

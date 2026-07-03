@@ -1,4 +1,4 @@
-# config.txt — Poracam v0.6.2
+# config.txt — Poracam v0.7
 # Interface simples para usuário final.
 #
 # Edite apenas os campos abaixo.
@@ -9,10 +9,6 @@ session_name=fishcam
 
 # Tempo total de gravação por ciclo, em minutos.
 # Se for maior que 10, o Poracam divide automaticamente em partes de até 10 minutos.
-# Exemplos:
-# 1  = gravar 1 minuto
-# 10 = gravar 10 minutos
-# 30 = gravar 30 minutos em 3 partes de 10 minutos
 record_duration_min=1
 
 # Período entre inícios de gravação, em minutos.
