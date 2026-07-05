@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-poracam_record.py — Poracam v0.7.1
+poracam_record.py — Poracam v0.7.2
 
-Novidades da v0.7.1:
+Novidades da v0.7.2:
 - Procura armazenamento externo com PORACAM/config.txt em /media/*/* e /mnt/*.
 - Se encontrar config externo, usa esse config e salva em PORACAM/media quando media_dir não estiver definido.
 - Mantém fallback local.
@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 PROJECT_NAME = "poracam"
-PROJECT_VERSION = "0.7.1"
+PROJECT_VERSION = "0.7.2"
 
 # ============================================================
 # Developer/internal configuration
@@ -45,7 +45,7 @@ MAX_STORAGE_PERCENT = 95.0
 AUDIO_DEVICE = "auto"
 AUDIO_FORMAT = "cd"
 
-# v0.7.1: Witty Pi usually starts Poracam as root/system.
+# v0.7.2: Witty Pi usually starts Poracam as root/system.
 # In that context ALSA PCM "default" may not exist, even if it works in an interactive shell.
 # "auto" probes default and then falls back to the first physical capture device from `arecord -l`.
 AUDIO_PROBE_SECONDS = 1
@@ -137,7 +137,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 }
 
 # User-facing keys accepted in config.txt.
-# Technical parameters are intentionally not accepted from config.txt in v0.7.1.
+# Technical parameters are intentionally not accepted from config.txt in v0.7.2.
 CONFIG_KEY_ALIASES = {
     "session_name": "session_name",
     "record_duration_min": "record_duration_min",
@@ -757,7 +757,7 @@ def validate_config(config: Dict[str, Any]) -> None:
     if int(config["cycle_period_s"]) < int(config["duration"]):
         raise ValueError(f"cycle_period_s precisa ser maior ou igual a record_duration_s/duration. Recebido: cycle_period_s={config['cycle_period_s']}, duration={config['duration']}")
     if str(config["run_mode"]).lower() != "single":
-        raise ValueError(f"Na v0.7.1, apenas run_mode=single é suportado. Recebido: run_mode={config['run_mode']}")
+        raise ValueError(f"Na v0.7.2, apenas run_mode=single é suportado. Recebido: run_mode={config['run_mode']}")
     for key in ("width", "height", "fps", "bitrate"):
         if int(config[key]) <= 0:
             raise ValueError(f"{key} precisa ser maior que zero.")
@@ -1502,7 +1502,7 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Poracam v0.7.1: config.txt simplificado + controle de energia via Witty Pi."
+        description="Poracam v0.7.2: config.txt simplificado + controle de energia via Witty Pi."
     )
 
     parser.add_argument(
@@ -1524,7 +1524,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     # Developer/installation flags. Not intended for the end-user config.txt.
     parser.add_argument("--power-control", action="store_true", help="Ativa agendamento Witty Pi + shutdown ao final da gravação.")
-    parser.add_argument("--no-power-control", action="store_true", help="Desativa controle de energia, mesmo na v0.7.1.")
+    parser.add_argument("--no-power-control", action="store_true", help="Desativa controle de energia, mesmo na v0.7.2.")
     parser.add_argument("--power-dry-run", action="store_true", help="Simula agendamento/shutdown sem escrever no Witty Pi nem desligar.")
     parser.add_argument("--wittypi-dir", default=None, help="Diretório do Witty Pi contendo utilities.sh.")
 

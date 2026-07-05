@@ -1,16 +1,18 @@
 #!/bin/bash
 # file: poracam_wittypi_power.sh
 #
-# Helper used by Poracam v0.7.1 to integrate with Witty Pi utilities.sh.
+# Helper used by Poracam v0.7.2 to integrate with Witty Pi utilities.sh.
 #
 # Actions:
 #   schedule-startup --target-epoch <epoch>
 #   shutdown
 #
-# This script is intentionally small and uses the official Witty Pi shell functions
-# from utilities.sh instead of reimplementing I2C access in Python.
+# Important:
+#   Do NOT use `set -u` here. The Witty Pi utilities.sh has functions that
+#   inspect optional positional parameters like $1. With nounset enabled,
+#   those functions can fail with "variável não associada".
 
-set -u
+set -o pipefail
 
 ACTION="${1:-}"
 shift || true
