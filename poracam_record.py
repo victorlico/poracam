@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-poracam_record.py — Poracam v0.7.3
+poracam_record.py — Poracam v0.7.4
 
-Novidades da v0.7.3:
+Novidades da v0.7.4:
+- Aguarda e tenta montar armazenamento externo USB antes de cair para armazenamento local.
 - Procura armazenamento externo com PORACAM/config.txt em /media/*/* e /mnt/*.
 - Se encontrar config externo, usa esse config e salva em PORACAM/media quando media_dir não estiver definido.
 - Mantém fallback local.
@@ -26,7 +27,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 PROJECT_NAME = "poracam"
-PROJECT_VERSION = "0.7.3"
+PROJECT_VERSION = "0.7.4"
 
 # ============================================================
 # Developer/internal configuration
@@ -42,10 +43,22 @@ ENABLE_SEGMENT_SPLIT = True
 DEFAULT_MEDIA_DIR = "/home/fishcam/poracam/media"
 MAX_STORAGE_PERCENT = 95.0
 
+# v0.7.4: wait briefly for USB storage at boot before falling back to local storage.
+# Balanced for short cycles: enough for USB enumeration, not so long that 1 min / 3 min cycles become too tight.
+EXTERNAL_CONFIG_WAIT_TIMEOUT_S = 25
+EXTERNAL_CONFIG_RETRY_INTERVAL_S = 2
+EXTERNAL_CONFIG_UDEV_SETTLE_TIMEOUT_S = 4
+EXTERNAL_CONFIG_TRY_MANUAL_MOUNT = True
+EXTERNAL_MOUNT_BASE_DIRS = [
+    "/media/fishcam",
+    "/mnt",
+]
+EXTERNAL_MOUNT_FS_TYPES = {"vfat", "exfat", "ext4"}
+
 AUDIO_DEVICE = "auto"
 AUDIO_FORMAT = "cd"
 
-# v0.7.3: Witty Pi usually starts Poracam as root/system.
+# v0.7.4: Witty Pi usually starts Poracam as root/system.
 # In that context ALSA PCM "default" may not exist, even if it works in an interactive shell.
 # "auto" probes default and then falls back to the first physical capture device from `arecord -l`.
 AUDIO_PROBE_SECONDS = 1
@@ -142,7 +155,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 }
 
 # User-facing keys accepted in config.txt.
-# Technical parameters are intentionally not accepted from config.txt in v0.7.3.
+# Technical parameters are intentionally not accepted from config.txt in v0.7.4.
 CONFIG_KEY_ALIASES = {
     "session_name": "session_name",
     "record_duration_min": "record_duration_min",
@@ -218,6 +231,246 @@ def find_external_config_path() -> Optional[Path]:
     return candidates[0] if candidates else None
 
 
+def sanitize_mount_name(value: str) -> str:
+    value = (value or "").strip()
+    if not value:
+        return ""
+    safe = []
+    for ch in value:
+        if ch.isalnum() or ch in ("-", "_", "."):
+            safe.append(ch)
+        else:
+            safe.append("_")
+    result = "".join(safe).strip("._")
+    return result[:64]
+
+
+def run_command_capture(command: List[str], timeout_s: int = 10) -> Tuple[int, str, str]:
+    try:
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout_s,
+            check=False,
+        )
+        return result.returncode, result.stdout or "", result.stderr or ""
+    except subprocess.TimeoutExpired as exc:
+        return 124, exc.stdout or "", exc.stderr or f"timeout after {timeout_s}s"
+    except Exception as exc:
+        return 1, "", str(exc)
+
+
+def udev_settle_for_storage(warnings: List[str]) -> None:
+    udevadm = shutil.which("udevadm")
+    if not udevadm:
+        return
+    rc, out, err = run_command_capture(
+        [udevadm, "settle", f"--timeout={int(EXTERNAL_CONFIG_UDEV_SETTLE_TIMEOUT_S)}"],
+        timeout_s=int(EXTERNAL_CONFIG_UDEV_SETTLE_TIMEOUT_S) + 2,
+    )
+    if rc != 0:
+        warnings.append(f"udevadm settle retornou código {rc}: {(out + err).strip()[-300:]}")
+
+
+def get_fishcam_uid_gid() -> Tuple[Optional[str], Optional[str]]:
+    try:
+        import pwd
+        pw = pwd.getpwnam("fishcam")
+        return str(pw.pw_uid), str(pw.pw_gid)
+    except Exception:
+        return None, None
+
+
+def iter_lsblk_devices(warnings: List[str]) -> List[Dict[str, Any]]:
+    lsblk = shutil.which("lsblk")
+    if not lsblk:
+        warnings.append("lsblk não encontrado; montagem manual de pendrive indisponível.")
+        return []
+
+    rc, out, err = run_command_capture(
+        [lsblk, "-J", "-o", "NAME,TYPE,FSTYPE,LABEL,UUID,MOUNTPOINT,RM"],
+        timeout_s=8,
+    )
+    if rc != 0:
+        warnings.append(f"lsblk falhou com código {rc}: {(out + err).strip()[-500:]}")
+        return []
+
+    try:
+        data = json.loads(out)
+    except Exception as exc:
+        warnings.append(f"falha ao interpretar saída JSON do lsblk: {exc}")
+        return []
+
+    devices: List[Dict[str, Any]] = []
+
+    def walk(node: Dict[str, Any]) -> None:
+        devices.append(node)
+        for child in node.get("children") or []:
+            walk(child)
+
+    for dev in data.get("blockdevices") or []:
+        walk(dev)
+
+    return devices
+
+
+def is_probably_usb_partition(dev: Dict[str, Any]) -> bool:
+    name = str(dev.get("name") or "")
+    dtype = str(dev.get("type") or "")
+    fstype = str(dev.get("fstype") or "").lower()
+    mountpoint = dev.get("mountpoint")
+    rm = dev.get("rm")
+
+    if dtype != "part":
+        return False
+    if not fstype or fstype not in EXTERNAL_MOUNT_FS_TYPES:
+        return False
+    if mountpoint:
+        return False
+
+    # Avoid touching the Raspberry system SD card.
+    if name.startswith("/dev/mmcblk"):
+        return False
+
+    # Common USB storage names. RM is not always reliable, so /dev/sd* is allowed.
+    if name.startswith("/dev/sd"):
+        return True
+
+    try:
+        if int(rm) == 1:
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def mount_options_for_fstype(fstype: str) -> List[str]:
+    fstype = (fstype or "").lower()
+    if fstype in ("vfat", "exfat"):
+        uid, gid = get_fishcam_uid_gid()
+        opts = ["rw", "sync", "umask=0002"]
+        if uid and gid:
+            opts.extend([f"uid={uid}", f"gid={gid}"])
+        return ["-o", ",".join(opts)]
+    return []
+
+
+def attempt_manual_mount_external_storage(warnings: List[str]) -> None:
+    if not EXTERNAL_CONFIG_TRY_MANUAL_MOUNT:
+        return
+
+    if os.geteuid() != 0:
+        warnings.append("montagem manual de pendrive ignorada: processo não está rodando como root.")
+        return
+
+    mount_cmd = shutil.which("mount")
+    if not mount_cmd:
+        warnings.append("comando mount não encontrado; montagem manual de pendrive indisponível.")
+        return
+
+    devices = iter_lsblk_devices(warnings)
+    candidates = [dev for dev in devices if is_probably_usb_partition(dev)]
+
+    if not candidates:
+        return
+
+    for dev in candidates:
+        name = str(dev.get("name") or "")
+        fstype = str(dev.get("fstype") or "").lower()
+        label = sanitize_mount_name(str(dev.get("label") or ""))
+        uuid = sanitize_mount_name(str(dev.get("uuid") or ""))
+        basename = sanitize_mount_name(Path(name).name)
+        mount_name = label or uuid or basename
+        if not mount_name:
+            continue
+
+        mounted = False
+        for base in EXTERNAL_MOUNT_BASE_DIRS:
+            base_path = Path(base)
+            try:
+                base_path.mkdir(parents=True, exist_ok=True)
+            except Exception as exc:
+                warnings.append(f"não foi possível criar base de montagem {base_path}: {exc}")
+                continue
+
+            target = base_path / mount_name
+            try:
+                target.mkdir(parents=True, exist_ok=True)
+            except Exception as exc:
+                warnings.append(f"não foi possível criar ponto de montagem {target}: {exc}")
+                continue
+
+            cmd = [mount_cmd] + mount_options_for_fstype(fstype) + [name, str(target)]
+            rc, out, err = run_command_capture(cmd, timeout_s=10)
+            msg = (out + err).strip()
+            if rc == 0:
+                warnings.append(f"pendrive montado manualmente: {name} -> {target}")
+                mounted = True
+                break
+
+            # If already mounted by a race between lsblk and mount, this is not fatal.
+            if "already mounted" in msg.lower() or "já está montado" in msg.lower():
+                warnings.append(f"pendrive já estava montado durante tentativa manual: {name}")
+                mounted = True
+                break
+
+            warnings.append(f"tentativa de montar {name} em {target} falhou com código {rc}: {msg[-300:]}")
+
+        if mounted and find_external_config_path() is not None:
+            return
+
+
+def wait_for_external_config_path(warnings: List[str]) -> Optional[Path]:
+    """
+    Wait briefly for PORACAM/config.txt on external storage.
+
+    This avoids a common Witty Pi boot race:
+    afterStartup starts Poracam before the USB pendrive has been automounted,
+    so older versions immediately fell back to local storage.
+    """
+    deadline = time.monotonic() + float(EXTERNAL_CONFIG_WAIT_TIMEOUT_S)
+    attempt = 0
+
+    while True:
+        attempt += 1
+
+        external = find_external_config_path()
+        if external is not None:
+            if attempt > 1:
+                warnings.append(f"armazenamento externo encontrado após {attempt} tentativas: {external}")
+            return external
+
+        warnings.append(f"armazenamento externo ainda não encontrado na tentativa {attempt}; tentando acelerar montagem USB.")
+
+        udev_settle_for_storage(warnings)
+
+        external = find_external_config_path()
+        if external is not None:
+            warnings.append(f"armazenamento externo encontrado após udevadm settle: {external}")
+            return external
+
+        attempt_manual_mount_external_storage(warnings)
+
+        external = find_external_config_path()
+        if external is not None:
+            warnings.append(f"armazenamento externo encontrado após tentativa de montagem manual: {external}")
+            return external
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            warnings.append(
+                "armazenamento externo não encontrado após "
+                f"{EXTERNAL_CONFIG_WAIT_TIMEOUT_S}s; usando fallback local se disponível."
+            )
+            return None
+
+        sleep_s = min(float(EXTERNAL_CONFIG_RETRY_INTERVAL_S), remaining)
+        time.sleep(sleep_s)
+
+
 def find_local_config_path() -> Optional[Path]:
     candidates = [
         Path.cwd() / "config.txt",
@@ -241,7 +494,7 @@ def determine_config_path(args: argparse.Namespace) -> Tuple[Optional[Path], str
     if args.config is not None:
         return Path(args.config).expanduser().resolve(), "cli", False, warnings
     if not args.ignore_external_storage:
-        external = find_external_config_path()
+        external = wait_for_external_config_path(warnings)
         if external is not None:
             return external, "external", True, warnings
     local = find_local_config_path()
@@ -500,7 +753,7 @@ def resolve_audio_device(config: Dict[str, Any], log_file: Path) -> Dict[str, An
     """
     Resolve the audio capture device with retry.
 
-    v0.7.3 rationale:
+    v0.7.4 rationale:
     after Witty Pi powers the Raspberry, the USB audio interface may not be immediately
     enumerated by ALSA. A single `arecord -l`/probe attempt can fail in the first seconds
     of boot even though the device becomes available shortly after.
@@ -809,7 +1062,7 @@ def validate_config(config: Dict[str, Any]) -> None:
     if int(config["cycle_period_s"]) < int(config["duration"]):
         raise ValueError(f"cycle_period_s precisa ser maior ou igual a record_duration_s/duration. Recebido: cycle_period_s={config['cycle_period_s']}, duration={config['duration']}")
     if str(config["run_mode"]).lower() != "single":
-        raise ValueError(f"Na v0.7.3, apenas run_mode=single é suportado. Recebido: run_mode={config['run_mode']}")
+        raise ValueError(f"Na v0.7.4, apenas run_mode=single é suportado. Recebido: run_mode={config['run_mode']}")
     for key in ("width", "height", "fps", "bitrate"):
         if int(config[key]) <= 0:
             raise ValueError(f"{key} precisa ser maior que zero.")
@@ -1403,6 +1656,9 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
             "max_storage_percent": float(config["max_storage_percent"]),
             "prefer_external_storage": bool(config["prefer_external_storage"]),
             "allow_local_fallback": bool(config["allow_local_fallback"]),
+            "external_config_wait_timeout_s": EXTERNAL_CONFIG_WAIT_TIMEOUT_S,
+            "external_config_retry_interval_s": EXTERNAL_CONFIG_RETRY_INTERVAL_S,
+            "external_config_try_manual_mount": EXTERNAL_CONFIG_TRY_MANUAL_MOUNT,
             "power_control_enabled": bool(config.get("power_control_enabled", False)),
             "power_dry_run": bool(config.get("power_dry_run", False)),
             "minimum_off_time_s": int(config.get("minimum_off_time_s", MINIMUM_OFF_TIME_S)),
@@ -1554,7 +1810,7 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Poracam v0.7.3: config.txt simplificado + controle de energia via Witty Pi."
+        description="Poracam v0.7.4: config.txt simplificado + controle de energia via Witty Pi."
     )
 
     parser.add_argument(
@@ -1576,7 +1832,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     # Developer/installation flags. Not intended for the end-user config.txt.
     parser.add_argument("--power-control", action="store_true", help="Ativa agendamento Witty Pi + shutdown ao final da gravação.")
-    parser.add_argument("--no-power-control", action="store_true", help="Desativa controle de energia, mesmo na v0.7.3.")
+    parser.add_argument("--no-power-control", action="store_true", help="Desativa controle de energia, mesmo na v0.7.4.")
     parser.add_argument("--power-dry-run", action="store_true", help="Simula agendamento/shutdown sem escrever no Witty Pi nem desligar.")
     parser.add_argument("--wittypi-dir", default=None, help="Diretório do Witty Pi contendo utilities.sh.")
 
