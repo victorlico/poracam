@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-poracam_record.py — Poracam v0.7.4
+poracam_record.py — Poracam v0.7.5
 
-Novidades da v0.7.4:
+Novidades da v0.7.5:
 - Aguarda e tenta montar armazenamento externo USB antes de cair para armazenamento local.
 - Procura armazenamento externo com PORACAM/config.txt em /media/*/* e /mnt/*.
 - Se encontrar config externo, usa esse config e salva em PORACAM/media quando media_dir não estiver definido.
@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 PROJECT_NAME = "poracam"
-PROJECT_VERSION = "0.7.4"
+PROJECT_VERSION = "0.7.5"
 
 # ============================================================
 # Developer/internal configuration
@@ -43,12 +43,19 @@ ENABLE_SEGMENT_SPLIT = True
 DEFAULT_MEDIA_DIR = "/home/fishcam/poracam/media"
 MAX_STORAGE_PERCENT = 95.0
 
-# v0.7.4: wait briefly for USB storage at boot before falling back to local storage.
+# v0.7.5: wait briefly for USB storage at boot before falling back to local storage.
 # Balanced for short cycles: enough for USB enumeration, not so long that 1 min / 3 min cycles become too tight.
 EXTERNAL_CONFIG_WAIT_TIMEOUT_S = 25
 EXTERNAL_CONFIG_RETRY_INTERVAL_S = 2
 EXTERNAL_CONFIG_UDEV_SETTLE_TIMEOUT_S = 4
 EXTERNAL_CONFIG_TRY_MANUAL_MOUNT = True
+
+# v0.7.5: if external storage was selected, verify it is still mounted before recording
+# and before writing metadata/status. This avoids writing to a stale /media directory
+# if the USB storage resets/disappears mid-cycle.
+EXTERNAL_STORAGE_VERIFY_BEFORE_RECORDING = True
+EXTERNAL_STORAGE_VERIFY_BEFORE_METADATA = True
+
 EXTERNAL_MOUNT_BASE_DIRS = [
     "/media/fishcam",
     "/mnt",
@@ -58,7 +65,7 @@ EXTERNAL_MOUNT_FS_TYPES = {"vfat", "exfat", "ext4"}
 AUDIO_DEVICE = "auto"
 AUDIO_FORMAT = "cd"
 
-# v0.7.4: Witty Pi usually starts Poracam as root/system.
+# v0.7.5: Witty Pi usually starts Poracam as root/system.
 # In that context ALSA PCM "default" may not exist, even if it works in an interactive shell.
 # "auto" probes default and then falls back to the first physical capture device from `arecord -l`.
 AUDIO_PROBE_SECONDS = 1
@@ -155,7 +162,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 }
 
 # User-facing keys accepted in config.txt.
-# Technical parameters are intentionally not accepted from config.txt in v0.7.4.
+# Technical parameters are intentionally not accepted from config.txt in v0.7.5.
 CONFIG_KEY_ALIASES = {
     "session_name": "session_name",
     "record_duration_min": "record_duration_min",
@@ -351,7 +358,7 @@ def mount_options_for_fstype(fstype: str) -> List[str]:
     fstype = (fstype or "").lower()
     if fstype in ("vfat", "exfat"):
         uid, gid = get_fishcam_uid_gid()
-        opts = ["rw", "sync", "umask=0002"]
+        opts = ["rw", "umask=0002"]
         if uid and gid:
             opts.extend([f"uid={uid}", f"gid={gid}"])
         return ["-o", ",".join(opts)]
@@ -469,6 +476,95 @@ def wait_for_external_config_path(warnings: List[str]) -> Optional[Path]:
 
         sleep_s = min(float(EXTERNAL_CONFIG_RETRY_INTERVAL_S), remaining)
         time.sleep(sleep_s)
+
+
+
+def external_mount_root_from_config(config_path: Optional[str]) -> Optional[Path]:
+    if not config_path:
+        return None
+    try:
+        p = Path(config_path).expanduser().resolve()
+    except Exception:
+        p = Path(config_path)
+    parts = list(p.parts)
+    if "PORACAM" not in parts:
+        return None
+    idx = parts.index("PORACAM")
+    if idx <= 0:
+        return None
+    try:
+        return Path(*parts[:idx])
+    except Exception:
+        return None
+
+
+def is_path_the_external_mountpoint(path: Path) -> bool:
+    """Return True only if path itself is a mount target, not merely under /."""
+    findmnt = shutil.which("findmnt")
+    if findmnt:
+        rc, out, err = run_command_capture([findmnt, "-T", str(path), "-n", "-o", "TARGET"], timeout_s=5)
+        if rc == 0:
+            target = out.strip().splitlines()[0] if out.strip() else ""
+            try:
+                return Path(target).resolve() == path.resolve()
+            except Exception:
+                return target == str(path)
+    try:
+        return path.exists() and os.path.ismount(str(path))
+    except Exception:
+        return False
+
+
+def verify_external_storage_alive(
+    *,
+    external_storage_used: bool,
+    config_source: Optional[str],
+    warnings: List[str],
+    context: str,
+) -> Tuple[bool, Optional[Path]]:
+    if not external_storage_used:
+        return True, None
+
+    mount_root = external_mount_root_from_config(config_source)
+    if mount_root is None:
+        warnings.append(f"{context}: não foi possível inferir ponto de montagem externo a partir de {config_source}")
+        return False, None
+
+    cfg = mount_root / "PORACAM" / "config.txt"
+    if is_path_the_external_mountpoint(mount_root) and cfg.exists():
+        return True, mount_root
+
+    warnings.append(f"{context}: ponto externo não está montado/estável: {mount_root}; tentando recuperar.")
+    udev_settle_for_storage(warnings)
+    attempt_manual_mount_external_storage(warnings)
+
+    if is_path_the_external_mountpoint(mount_root) and cfg.exists():
+        warnings.append(f"{context}: ponto externo recuperado: {mount_root}")
+        return True, mount_root
+
+    alt = find_external_config_path()
+    if alt is not None:
+        alt_root = external_mount_root_from_config(str(alt))
+        if alt_root and is_path_the_external_mountpoint(alt_root):
+            warnings.append(f"{context}: armazenamento externo reapareceu em outro caminho: {alt}")
+            return True, alt_root
+
+    warnings.append(f"{context}: armazenamento externo indisponível após tentativa de recuperação.")
+    return False, mount_root
+
+
+def save_recovery_metadata(metadata: Dict[str, Any], reason: str) -> Optional[str]:
+    try:
+        recovery_dir = Path(DEFAULT_MEDIA_DIR) / "recovery_metadata"
+        recovery_dir.mkdir(parents=True, exist_ok=True)
+        path = recovery_dir / f"{now_stamp()}_poracam_recovery_metadata.json"
+        recovery = dict(metadata)
+        recovery["recovery_reason"] = reason
+        recovery["recovery_saved_at"] = iso_now()
+        path.write_text(json.dumps(recovery, indent=2, ensure_ascii=False), encoding="utf-8")
+        return str(path)
+    except Exception:
+        return None
 
 
 def find_local_config_path() -> Optional[Path]:
@@ -753,7 +849,7 @@ def resolve_audio_device(config: Dict[str, Any], log_file: Path) -> Dict[str, An
     """
     Resolve the audio capture device with retry.
 
-    v0.7.4 rationale:
+    v0.7.5 rationale:
     after Witty Pi powers the Raspberry, the USB audio interface may not be immediately
     enumerated by ALSA. A single `arecord -l`/probe attempt can fail in the first seconds
     of boot even though the device becomes available shortly after.
@@ -1062,7 +1158,7 @@ def validate_config(config: Dict[str, Any]) -> None:
     if int(config["cycle_period_s"]) < int(config["duration"]):
         raise ValueError(f"cycle_period_s precisa ser maior ou igual a record_duration_s/duration. Recebido: cycle_period_s={config['cycle_period_s']}, duration={config['duration']}")
     if str(config["run_mode"]).lower() != "single":
-        raise ValueError(f"Na v0.7.4, apenas run_mode=single é suportado. Recebido: run_mode={config['run_mode']}")
+        raise ValueError(f"Na v0.7.5, apenas run_mode=single é suportado. Recebido: run_mode={config['run_mode']}")
     for key in ("width", "height", "fps", "bitrate"):
         if int(config[key]) <= 0:
             raise ValueError(f"{key} precisa ser maior que zero.")
@@ -1621,6 +1717,7 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
         "config_source": config_source,
         "config_source_type": config_source_type,
         "external_storage_used": external_storage_used,
+        "external_mount_root": None,
         "config_warnings": config_warnings,
         "media_dir": str(media_dir),
         "status_dir": str(status_dir),
@@ -1659,6 +1756,8 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
             "external_config_wait_timeout_s": EXTERNAL_CONFIG_WAIT_TIMEOUT_S,
             "external_config_retry_interval_s": EXTERNAL_CONFIG_RETRY_INTERVAL_S,
             "external_config_try_manual_mount": EXTERNAL_CONFIG_TRY_MANUAL_MOUNT,
+            "external_storage_verify_before_recording": EXTERNAL_STORAGE_VERIFY_BEFORE_RECORDING,
+            "external_storage_verify_before_metadata": EXTERNAL_STORAGE_VERIFY_BEFORE_METADATA,
             "power_control_enabled": bool(config.get("power_control_enabled", False)),
             "power_dry_run": bool(config.get("power_dry_run", False)),
             "minimum_off_time_s": int(config.get("minimum_off_time_s", MINIMUM_OFF_TIME_S)),
@@ -1679,6 +1778,20 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
     }
 
     try:
+        if EXTERNAL_STORAGE_VERIFY_BEFORE_RECORDING and external_storage_used:
+            ok_ext, mount_root = verify_external_storage_alive(
+                external_storage_used=external_storage_used,
+                config_source=config_source,
+                warnings=config_warnings,
+                context="pré-gravação",
+            )
+            metadata["external_mount_root"] = str(mount_root) if mount_root else None
+            if not ok_ext:
+                raise RuntimeError(
+                    "Armazenamento externo foi selecionado, mas não está montado/estável antes da gravação. "
+                    "Abortando para evitar gravar em diretório local disfarçado de /media."
+                )
+
         append_log(log_file, f"Poracam v{PROJECT_VERSION} recording started")
         append_log(log_file, f"Config source: {config_source or 'internal defaults / CLI only'}")
         append_log(log_file, f"Config source type: {config_source_type}")
@@ -1778,6 +1891,25 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
         }
         metadata["error"] = error_message
 
+        if EXTERNAL_STORAGE_VERIFY_BEFORE_METADATA and external_storage_used:
+            ok_ext_meta, mount_root_meta = verify_external_storage_alive(
+                external_storage_used=external_storage_used,
+                config_source=config_source,
+                warnings=config_warnings,
+                context="pré-metadata",
+            )
+            metadata["external_mount_root"] = str(mount_root_meta) if mount_root_meta else metadata.get("external_mount_root")
+            metadata["config_warnings"] = config_warnings
+            if not ok_ext_meta:
+                recovery_path = save_recovery_metadata(metadata, "external_storage_unavailable_before_metadata")
+                if recovery_path:
+                    append_log(log_file, f"RECOVERY metadata saved locally: {recovery_path}")
+                raise RuntimeError(
+                    "Armazenamento externo desapareceu antes de salvar metadata/status. "
+                    f"Recovery local: {recovery_path or 'falhou'}"
+                )
+
+        metadata_file.parent.mkdir(parents=True, exist_ok=True)
         with metadata_file.open("w", encoding="utf-8") as f:
             json.dump(metadata, f, indent=2, ensure_ascii=False)
         try:
@@ -1789,6 +1921,7 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
         try:
             power_info = perform_power_control(config, status, start_epoch, log_file)
             metadata["power"] = power_info
+            metadata_file.parent.mkdir(parents=True, exist_ok=True)
             with metadata_file.open("w", encoding="utf-8") as f:
                 json.dump(metadata, f, indent=2, ensure_ascii=False)
             try:
@@ -1799,6 +1932,7 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
         except Exception as power_exc:
             append_log(log_file, f"POWER ERROR: unexpected failure: {power_exc}")
             metadata["power"] = {"enabled": bool(config.get("power_control_enabled", False)), "error": str(power_exc)}
+            metadata_file.parent.mkdir(parents=True, exist_ok=True)
             with metadata_file.open("w", encoding="utf-8") as f:
                 json.dump(metadata, f, indent=2, ensure_ascii=False)
 
@@ -1810,7 +1944,7 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Poracam v0.7.4: config.txt simplificado + controle de energia via Witty Pi."
+        description="Poracam v0.7.5: config.txt simplificado + controle de energia via Witty Pi."
     )
 
     parser.add_argument(
@@ -1832,7 +1966,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     # Developer/installation flags. Not intended for the end-user config.txt.
     parser.add_argument("--power-control", action="store_true", help="Ativa agendamento Witty Pi + shutdown ao final da gravação.")
-    parser.add_argument("--no-power-control", action="store_true", help="Desativa controle de energia, mesmo na v0.7.4.")
+    parser.add_argument("--no-power-control", action="store_true", help="Desativa controle de energia, mesmo na v0.7.5.")
     parser.add_argument("--power-dry-run", action="store_true", help="Simula agendamento/shutdown sem escrever no Witty Pi nem desligar.")
     parser.add_argument("--wittypi-dir", default=None, help="Diretório do Witty Pi contendo utilities.sh.")
 
