@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-poracam_record.py — Poracam v0.7.5
+poracam_record.py — Poracam v0.7.7
 
-Novidades da v0.7.5:
+Novidades da v0.7.7:
 - Aguarda e tenta montar armazenamento externo USB antes de cair para armazenamento local.
 - Procura armazenamento externo com PORACAM/config.txt em /media/*/* e /mnt/*.
 - Se encontrar config externo, usa esse config e salva em PORACAM/media quando media_dir não estiver definido.
@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 PROJECT_NAME = "poracam"
-PROJECT_VERSION = "0.7.5"
+PROJECT_VERSION = "0.7.7"
 
 # ============================================================
 # Developer/internal configuration
@@ -42,15 +42,17 @@ ENABLE_SEGMENT_SPLIT = True
 
 DEFAULT_MEDIA_DIR = "/home/fishcam/poracam/media"
 MAX_STORAGE_PERCENT = 95.0
+MIN_FREE_MB_BEFORE_RECORDING = 300
+STOP_SCHEDULING_WHEN_STORAGE_FULL = True
 
-# v0.7.5: wait briefly for USB storage at boot before falling back to local storage.
+# v0.7.7: wait briefly for USB storage at boot before falling back to local storage.
 # Balanced for short cycles: enough for USB enumeration, not so long that 1 min / 3 min cycles become too tight.
-EXTERNAL_CONFIG_WAIT_TIMEOUT_S = 25
-EXTERNAL_CONFIG_RETRY_INTERVAL_S = 2
+EXTERNAL_CONFIG_WAIT_TIMEOUT_S = 10
+EXTERNAL_CONFIG_RETRY_INTERVAL_S = 1
 EXTERNAL_CONFIG_UDEV_SETTLE_TIMEOUT_S = 4
 EXTERNAL_CONFIG_TRY_MANUAL_MOUNT = True
 
-# v0.7.5: if external storage was selected, verify it is still mounted before recording
+# v0.7.7: if external storage was selected, verify it is still mounted before recording
 # and before writing metadata/status. This avoids writing to a stale /media directory
 # if the USB storage resets/disappears mid-cycle.
 EXTERNAL_STORAGE_VERIFY_BEFORE_RECORDING = True
@@ -65,7 +67,7 @@ EXTERNAL_MOUNT_FS_TYPES = {"vfat", "exfat", "ext4"}
 AUDIO_DEVICE = "auto"
 AUDIO_FORMAT = "cd"
 
-# v0.7.5: Witty Pi usually starts Poracam as root/system.
+# v0.7.7: Witty Pi usually starts Poracam as root/system.
 # In that context ALSA PCM "default" may not exist, even if it works in an interactive shell.
 # "auto" probes default and then falls back to the first physical capture device from `arecord -l`.
 AUDIO_PROBE_SECONDS = 1
@@ -93,7 +95,7 @@ WITTYPI_DIR_CANDIDATES = [
 ]
 WITTYPI_POWER_SCRIPT_NAME = "poracam_wittypi_power.sh"
 MINIMUM_OFF_TIME_S = 60
-SHUTDOWN_DELAY_S = 10
+SHUTDOWN_DELAY_S = 5
 REQUIRE_STARTUP_SCHEDULE_BEFORE_SHUTDOWN = True
 
 VIDEO_PROFILES: Dict[str, Dict[str, int]] = {
@@ -136,10 +138,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # Internal/developer fields
     "run_mode": "single",
     "media_dir": DEFAULT_MEDIA_DIR,
-    "width": VIDEO_PROFILES["high"]["width"],
-    "height": VIDEO_PROFILES["high"]["height"],
-    "fps": VIDEO_PROFILES["high"]["fps"],
-    "bitrate": VIDEO_PROFILES["high"]["bitrate"],
+    "width": VIDEO_PROFILES["balanced"]["width"],
+    "height": VIDEO_PROFILES["balanced"]["height"],
+    "fps": VIDEO_PROFILES["balanced"]["fps"],
+    "bitrate": VIDEO_PROFILES["balanced"]["bitrate"],
     "audio_device": AUDIO_DEVICE,
     "audio_format": AUDIO_FORMAT,
     "keep_h264": KEEP_H264,
@@ -162,7 +164,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 }
 
 # User-facing keys accepted in config.txt.
-# Technical parameters are intentionally not accepted from config.txt in v0.7.5.
+# Technical parameters are intentionally not accepted from config.txt in v0.7.7.
 CONFIG_KEY_ALIASES = {
     "session_name": "session_name",
     "record_duration_min": "record_duration_min",
@@ -849,7 +851,7 @@ def resolve_audio_device(config: Dict[str, Any], log_file: Path) -> Dict[str, An
     """
     Resolve the audio capture device with retry.
 
-    v0.7.5 rationale:
+    v0.7.7 rationale:
     after Witty Pi powers the Raspberry, the USB audio interface may not be immediately
     enumerated by ALSA. A single `arecord -l`/probe attempt can fail in the first seconds
     of boot even though the device becomes available shortly after.
@@ -1117,6 +1119,11 @@ def remove_file(path: Path, log_file: Path) -> bool:
     return True
 
 
+class StorageFullError(RuntimeError):
+    """Raised when storage is too full to safely start another recording cycle."""
+    pass
+
+
 def get_storage_info(path: Path) -> Dict[str, Any]:
     usage = shutil.disk_usage(str(path))
     used_bytes = usage.total - usage.free
@@ -1134,7 +1141,14 @@ def get_storage_info(path: Path) -> Dict[str, Any]:
 def check_storage_or_fail(path: Path, max_storage_percent: float) -> Dict[str, Any]:
     info = get_storage_info(path)
     if info["used_percent"] >= max_storage_percent:
-        raise RuntimeError(f"Uso do armazenamento acima do limite: {info['used_percent']}% usado, limite={max_storage_percent}%")
+        raise StorageFullError(
+            f"Uso do armazenamento acima do limite: {info['used_percent']}% usado, limite={max_storage_percent}%"
+        )
+    if float(info["free_mb"]) < float(MIN_FREE_MB_BEFORE_RECORDING):
+        raise StorageFullError(
+            "Espaço livre abaixo do mínimo para iniciar gravação: "
+            f"{info['free_mb']} MB livre, mínimo={MIN_FREE_MB_BEFORE_RECORDING} MB"
+        )
     return info
 
 
@@ -1158,7 +1172,7 @@ def validate_config(config: Dict[str, Any]) -> None:
     if int(config["cycle_period_s"]) < int(config["duration"]):
         raise ValueError(f"cycle_period_s precisa ser maior ou igual a record_duration_s/duration. Recebido: cycle_period_s={config['cycle_period_s']}, duration={config['duration']}")
     if str(config["run_mode"]).lower() != "single":
-        raise ValueError(f"Na v0.7.5, apenas run_mode=single é suportado. Recebido: run_mode={config['run_mode']}")
+        raise ValueError(f"Na v0.7.7, apenas run_mode=single é suportado. Recebido: run_mode={config['run_mode']}")
     for key in ("width", "height", "fps", "bitrate"):
         if int(config[key]) <= 0:
             raise ValueError(f"{key} precisa ser maior que zero.")
@@ -1619,20 +1633,36 @@ def perform_power_control(
         append_log(log_file, "POWER: disabled; not scheduling startup or shutdown.")
         return power
 
-    schedule_result = run_power_wrapper(
-        action="schedule-startup",
-        target_epoch=target_epoch,
-        wittypi_dir=wittypi_dir,
-        dry_run=dry_run,
-        log_file=log_file,
-    )
-    power["schedule_result"] = schedule_result
+    stop_scheduling = bool(config.get("_poracam_stop_scheduling", False))
+    stop_scheduling_reason = str(config.get("_poracam_stop_scheduling_reason", "")) if stop_scheduling else None
+    power["stop_scheduling"] = stop_scheduling
+    power["stop_scheduling_reason"] = stop_scheduling_reason
+
+    if stop_scheduling:
+        power["schedule_result"] = {
+            "ok": True,
+            "skipped": True,
+            "reason": stop_scheduling_reason,
+            "message": "Next startup intentionally not scheduled.",
+        }
+        power["next_startup_epoch"] = None
+        power["next_startup_time"] = None
+        append_log(log_file, f"POWER: startup scheduling skipped intentionally: {stop_scheduling_reason}")
+    else:
+        schedule_result = run_power_wrapper(
+            action="schedule-startup",
+            target_epoch=target_epoch,
+            wittypi_dir=wittypi_dir,
+            dry_run=dry_run,
+            log_file=log_file,
+        )
+        power["schedule_result"] = schedule_result
 
     if not shutdown_after_recording:
         power["shutdown_skipped_reason"] = "shutdown_after_recording_false"
         return power
 
-    if require_schedule and not schedule_result.get("ok"):
+    if (not stop_scheduling) and require_schedule and not power["schedule_result"].get("ok"):
         power["shutdown_skipped_reason"] = "startup_schedule_failed"
         append_log(log_file, "POWER: startup schedule failed; shutdown skipped to avoid losing recovery.")
         return power
@@ -1687,6 +1717,7 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
 
     status = "unknown"
     error_message: Optional[str] = None
+    stop_scheduling_reason: Optional[str] = None
     storage_before: Optional[Dict[str, Any]] = None
     storage_after: Optional[Dict[str, Any]] = None
     camera_conflicts: Optional[Dict[str, Any]] = None
@@ -1751,6 +1782,8 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
             "start_delay_s": float(config["start_delay"]),
             "extra_timeout_s": float(config["extra_timeout"]),
             "max_storage_percent": float(config["max_storage_percent"]),
+            "min_free_mb_before_recording": MIN_FREE_MB_BEFORE_RECORDING,
+            "stop_scheduling_when_storage_full": STOP_SCHEDULING_WHEN_STORAGE_FULL,
             "prefer_external_storage": bool(config["prefer_external_storage"]),
             "allow_local_fallback": bool(config["allow_local_fallback"]),
             "external_config_wait_timeout_s": EXTERNAL_CONFIG_WAIT_TIMEOUT_S,
@@ -1856,6 +1889,20 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
 
         status = "ok"
 
+    except StorageFullError as exc:
+        status = "error"
+        error_message = str(exc)
+        if STOP_SCHEDULING_WHEN_STORAGE_FULL:
+            stop_scheduling_reason = "storage_full"
+            config["_poracam_stop_scheduling"] = True
+            config["_poracam_stop_scheduling_reason"] = stop_scheduling_reason
+        append_log(log_file, f"ERROR: {error_message}")
+        append_log(log_file, "POWER: storage full policy active; next startup will not be scheduled.")
+        try:
+            storage_after = get_storage_info(media_dir)
+        except Exception:
+            storage_after = None
+
     except Exception as exc:
         status = "error"
         error_message = str(exc)
@@ -1890,6 +1937,7 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
             "segments_total": segment_count,
         }
         metadata["error"] = error_message
+        metadata["stop_scheduling_reason"] = stop_scheduling_reason
 
         if EXTERNAL_STORAGE_VERIFY_BEFORE_METADATA and external_storage_used:
             ok_ext_meta, mount_root_meta = verify_external_storage_alive(
@@ -1944,7 +1992,7 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Poracam v0.7.5: config.txt simplificado + controle de energia via Witty Pi."
+        description="Poracam v0.7.7: perfil balanced + tempos otimizados + controle de energia via Witty Pi."
     )
 
     parser.add_argument(
@@ -1966,7 +2014,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     # Developer/installation flags. Not intended for the end-user config.txt.
     parser.add_argument("--power-control", action="store_true", help="Ativa agendamento Witty Pi + shutdown ao final da gravação.")
-    parser.add_argument("--no-power-control", action="store_true", help="Desativa controle de energia, mesmo na v0.7.5.")
+    parser.add_argument("--no-power-control", action="store_true", help="Desativa controle de energia, mesmo na v0.7.7.")
     parser.add_argument("--power-dry-run", action="store_true", help="Simula agendamento/shutdown sem escrever no Witty Pi nem desligar.")
     parser.add_argument("--wittypi-dir", default=None, help="Diretório do Witty Pi contendo utilities.sh.")
 
