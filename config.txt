@@ -1,4 +1,4 @@
-# config.txt — Poracam v0.7.7
+# config.txt — Poracam v0.7.8
 # Interface simples para usuário final.
 #
 # Edite apenas os campos abaixo.
@@ -12,7 +12,7 @@ session_name=fishcam
 record_duration_min=1
 
 # Período entre inícios de gravação, em minutos.
-# Exemplo: 5 = iniciar uma gravação a cada 5 minutos.
+# Exemplo: 3 = iniciar uma gravação a cada 3 minutos.
 # Este valor precisa ser maior que record_duration_min.
 cycle_period_min=3
 

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-poracam_record.py — Poracam v0.7.7
+poracam_record.py — Poracam v0.7.8
 
-Novidades da v0.7.7:
+Novidades da v0.7.8:
 - Aguarda e tenta montar armazenamento externo USB antes de cair para armazenamento local.
 - Procura armazenamento externo com PORACAM/config.txt em /media/*/* e /mnt/*.
 - Se encontrar config externo, usa esse config e salva em PORACAM/media quando media_dir não estiver definido.
@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 PROJECT_NAME = "poracam"
-PROJECT_VERSION = "0.7.7"
+PROJECT_VERSION = "0.7.8"
 
 # ============================================================
 # Developer/internal configuration
@@ -45,18 +45,22 @@ MAX_STORAGE_PERCENT = 95.0
 MIN_FREE_MB_BEFORE_RECORDING = 300
 STOP_SCHEDULING_WHEN_STORAGE_FULL = True
 
-# v0.7.7: wait briefly for USB storage at boot before falling back to local storage.
+# v0.7.8: wait briefly for USB storage at boot before falling back to local storage.
 # Balanced for short cycles: enough for USB enumeration, not so long that 1 min / 3 min cycles become too tight.
-EXTERNAL_CONFIG_WAIT_TIMEOUT_S = 10
-EXTERNAL_CONFIG_RETRY_INTERVAL_S = 1
+EXTERNAL_CONFIG_WAIT_TIMEOUT_S = 30
+EXTERNAL_CONFIG_RETRY_INTERVAL_S = 2
 EXTERNAL_CONFIG_UDEV_SETTLE_TIMEOUT_S = 4
 EXTERNAL_CONFIG_TRY_MANUAL_MOUNT = True
 
-# v0.7.7: if external storage was selected, verify it is still mounted before recording
+# v0.7.8: if external storage was selected, verify it is still mounted before recording
 # and before writing metadata/status. This avoids writing to a stale /media directory
 # if the USB storage resets/disappears mid-cycle.
 EXTERNAL_STORAGE_VERIFY_BEFORE_RECORDING = True
 EXTERNAL_STORAGE_VERIFY_BEFORE_METADATA = True
+
+# v0.7.8: in autonomous/Witty Pi mode, never silently record to local SD
+# when the PORACAM pendrive is missing. This prevents losing field data on the Pi.
+REQUIRE_EXTERNAL_STORAGE_IN_POWER_CONTROL = True
 
 EXTERNAL_MOUNT_BASE_DIRS = [
     "/media/fishcam",
@@ -67,7 +71,7 @@ EXTERNAL_MOUNT_FS_TYPES = {"vfat", "exfat", "ext4"}
 AUDIO_DEVICE = "auto"
 AUDIO_FORMAT = "cd"
 
-# v0.7.7: Witty Pi usually starts Poracam as root/system.
+# v0.7.8: Witty Pi usually starts Poracam as root/system.
 # In that context ALSA PCM "default" may not exist, even if it works in an interactive shell.
 # "auto" probes default and then falls back to the first physical capture device from `arecord -l`.
 AUDIO_PROBE_SECONDS = 1
@@ -127,7 +131,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "session_name": DEFAULT_SESSION_NAME,
     "record_duration_min": 1.0,
     "cycle_period_min": 5.0,
-    "video_quality": "high",
+    "video_quality": "balanced",
 
     # Runtime fields derived from user-facing fields
     "duration": 60,
@@ -150,6 +154,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "max_storage_percent": MAX_STORAGE_PERCENT,
     "prefer_external_storage": True,
     "allow_local_fallback": True,
+    "require_external_storage_in_power_control": REQUIRE_EXTERNAL_STORAGE_IN_POWER_CONTROL,
     "power_control_enabled": WITTYPI_POWER_CONTROL_ENABLED_BY_DEFAULT,
     "power_dry_run": False,
     "shutdown_after_recording": True,
@@ -164,7 +169,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 }
 
 # User-facing keys accepted in config.txt.
-# Technical parameters are intentionally not accepted from config.txt in v0.7.7.
+# Technical parameters are intentionally not accepted from config.txt in v0.7.8.
 CONFIG_KEY_ALIASES = {
     "session_name": "session_name",
     "record_duration_min": "record_duration_min",
@@ -344,7 +349,7 @@ def is_probably_usb_partition(dev: Dict[str, Any]) -> bool:
         return False
 
     # Common USB storage names. RM is not always reliable, so /dev/sd* is allowed.
-    if name.startswith("/dev/sd"):
+    if name.startswith("/dev/sd") or name.startswith("sd"):
         return True
 
     try:
@@ -354,6 +359,15 @@ def is_probably_usb_partition(dev: Dict[str, Any]) -> bool:
         pass
 
     return False
+
+
+def block_device_path(name: str) -> str:
+    name = str(name or "").strip()
+    if not name:
+        return name
+    if name.startswith("/dev/"):
+        return name
+    return f"/dev/{name}"
 
 
 def mount_options_for_fstype(fstype: str) -> List[str]:
@@ -388,6 +402,7 @@ def attempt_manual_mount_external_storage(warnings: List[str]) -> None:
 
     for dev in candidates:
         name = str(dev.get("name") or "")
+        dev_path = block_device_path(name)
         fstype = str(dev.get("fstype") or "").lower()
         label = sanitize_mount_name(str(dev.get("label") or ""))
         uuid = sanitize_mount_name(str(dev.get("uuid") or ""))
@@ -412,21 +427,21 @@ def attempt_manual_mount_external_storage(warnings: List[str]) -> None:
                 warnings.append(f"não foi possível criar ponto de montagem {target}: {exc}")
                 continue
 
-            cmd = [mount_cmd] + mount_options_for_fstype(fstype) + [name, str(target)]
+            cmd = [mount_cmd] + mount_options_for_fstype(fstype) + [dev_path, str(target)]
             rc, out, err = run_command_capture(cmd, timeout_s=10)
             msg = (out + err).strip()
             if rc == 0:
-                warnings.append(f"pendrive montado manualmente: {name} -> {target}")
+                warnings.append(f"pendrive montado manualmente: {dev_path} -> {target}")
                 mounted = True
                 break
 
             # If already mounted by a race between lsblk and mount, this is not fatal.
             if "already mounted" in msg.lower() or "já está montado" in msg.lower():
-                warnings.append(f"pendrive já estava montado durante tentativa manual: {name}")
+                warnings.append(f"pendrive já estava montado durante tentativa manual: {dev_path}")
                 mounted = True
                 break
 
-            warnings.append(f"tentativa de montar {name} em {target} falhou com código {rc}: {msg[-300:]}")
+            warnings.append(f"tentativa de montar {dev_path} em {target} falhou com código {rc}: {msg[-300:]}")
 
         if mounted and find_external_config_path() is not None:
             return
@@ -778,6 +793,20 @@ def merge_config(args: argparse.Namespace) -> Tuple[Dict[str, Any], Optional[str
     if args.wittypi_dir:
         final_config["wittypi_dir"] = args.wittypi_dir
 
+    if (
+        bool(final_config.get("power_control_enabled", False))
+        and bool(final_config.get("require_external_storage_in_power_control", REQUIRE_EXTERNAL_STORAGE_IN_POWER_CONTROL))
+        and not external_used
+        and not args.ignore_external_storage
+    ):
+        final_config["_poracam_external_required_missing"] = True
+        final_config["_poracam_stop_scheduling"] = True
+        final_config["_poracam_stop_scheduling_reason"] = "external_storage_missing"
+        warnings.append(
+            "modo power-control requer armazenamento externo; "
+            "fallback local foi bloqueado para evitar gravar dados no cartão SD."
+        )
+
     return final_config, config_source, source_type, external_used, warnings
 
 
@@ -851,7 +880,7 @@ def resolve_audio_device(config: Dict[str, Any], log_file: Path) -> Dict[str, An
     """
     Resolve the audio capture device with retry.
 
-    v0.7.7 rationale:
+    v0.7.8 rationale:
     after Witty Pi powers the Raspberry, the USB audio interface may not be immediately
     enumerated by ALSA. A single `arecord -l`/probe attempt can fail in the first seconds
     of boot even though the device becomes available shortly after.
@@ -1119,6 +1148,11 @@ def remove_file(path: Path, log_file: Path) -> bool:
     return True
 
 
+class ExternalStorageRequiredError(RuntimeError):
+    """Raised when autonomous mode requires a PORACAM pendrive but none is available."""
+    pass
+
+
 class StorageFullError(RuntimeError):
     """Raised when storage is too full to safely start another recording cycle."""
     pass
@@ -1172,7 +1206,7 @@ def validate_config(config: Dict[str, Any]) -> None:
     if int(config["cycle_period_s"]) < int(config["duration"]):
         raise ValueError(f"cycle_period_s precisa ser maior ou igual a record_duration_s/duration. Recebido: cycle_period_s={config['cycle_period_s']}, duration={config['duration']}")
     if str(config["run_mode"]).lower() != "single":
-        raise ValueError(f"Na v0.7.7, apenas run_mode=single é suportado. Recebido: run_mode={config['run_mode']}")
+        raise ValueError(f"Na v0.7.8, apenas run_mode=single é suportado. Recebido: run_mode={config['run_mode']}")
     for key in ("width", "height", "fps", "bitrate"):
         if int(config[key]) <= 0:
             raise ValueError(f"{key} precisa ser maior que zero.")
@@ -1784,6 +1818,7 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
             "max_storage_percent": float(config["max_storage_percent"]),
             "min_free_mb_before_recording": MIN_FREE_MB_BEFORE_RECORDING,
             "stop_scheduling_when_storage_full": STOP_SCHEDULING_WHEN_STORAGE_FULL,
+            "require_external_storage_in_power_control": REQUIRE_EXTERNAL_STORAGE_IN_POWER_CONTROL,
             "prefer_external_storage": bool(config["prefer_external_storage"]),
             "allow_local_fallback": bool(config["allow_local_fallback"]),
             "external_config_wait_timeout_s": EXTERNAL_CONFIG_WAIT_TIMEOUT_S,
@@ -1831,6 +1866,12 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
         append_log(log_file, f"External storage used: {external_storage_used}")
         for warning in config_warnings:
             append_log(log_file, f"CONFIG WARNING: {warning}")
+
+        if bool(config.get("_poracam_external_required_missing", False)):
+            raise ExternalStorageRequiredError(
+                "Armazenamento externo PORACAM não encontrado em modo power-control. "
+                "Fallback local bloqueado; gravação não iniciada."
+            )
 
         audio_resolution = resolve_audio_device(config, log_file)
         metadata["audio"] = audio_resolution
@@ -1902,6 +1943,15 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
             storage_after = get_storage_info(media_dir)
         except Exception:
             storage_after = None
+
+    except ExternalStorageRequiredError as exc:
+        status = "error"
+        error_message = str(exc)
+        stop_scheduling_reason = "external_storage_missing"
+        config["_poracam_stop_scheduling"] = True
+        config["_poracam_stop_scheduling_reason"] = stop_scheduling_reason
+        append_log(log_file, f"ERROR: {error_message}")
+        append_log(log_file, "POWER: external storage missing; next startup will not be scheduled.")
 
     except Exception as exc:
         status = "error"
@@ -1992,7 +2042,7 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Poracam v0.7.7: perfil balanced + tempos otimizados + controle de energia via Witty Pi."
+        description="Poracam v0.7.8: balanced + pendrive obrigatório em power-control + Witty Pi."
     )
 
     parser.add_argument(
@@ -2014,7 +2064,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     # Developer/installation flags. Not intended for the end-user config.txt.
     parser.add_argument("--power-control", action="store_true", help="Ativa agendamento Witty Pi + shutdown ao final da gravação.")
-    parser.add_argument("--no-power-control", action="store_true", help="Desativa controle de energia, mesmo na v0.7.7.")
+    parser.add_argument("--no-power-control", action="store_true", help="Desativa controle de energia, mesmo na v0.7.8.")
     parser.add_argument("--power-dry-run", action="store_true", help="Simula agendamento/shutdown sem escrever no Witty Pi nem desligar.")
     parser.add_argument("--wittypi-dir", default=None, help="Diretório do Witty Pi contendo utilities.sh.")
 
