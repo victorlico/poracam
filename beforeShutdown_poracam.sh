@@ -1,7 +1,7 @@
 #!/bin/bash
 # file: beforeShutdown.sh
 #
-# Optional defensive Witty Pi beforeShutdown.sh for Poracam v0.7.9.
+# Optional defensive Witty Pi beforeShutdown.sh for Poracam v0.8.1.
 # Poracam already syncs files before requesting shutdown; this is only an extra guard.
 
 LOG="/home/fishcam/poracam/poracam_beforeShutdown.log"

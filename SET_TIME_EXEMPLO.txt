@@ -1,0 +1,17 @@
+# SET_TIME.txt — arquivo de comando de data/hora Poracam
+#
+# Coloque este arquivo dentro da pasta PORACAM, ao lado do config.txt.
+# No próximo boot, o Poracam irá:
+# 1. ler a primeira linha válida;
+# 2. ajustar a hora do sistema;
+# 3. gravar a hora no RTC do Witty Pi;
+# 4. apagar este arquivo se tudo der certo.
+#
+# Formatos aceitos:
+# 2026-07-17 11:48:00 -04
+# 2026-07-17 11:48:00 -0400
+# 2026-07-17T11:48:00-04:00
+# 2026-07-17 11:48:00
+#
+# Edite a linha abaixo antes de usar:
+2026-07-17 11:48:00 -04

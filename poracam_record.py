@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-poracam_record.py — Poracam v0.7.9
+poracam_record.py — Poracam v0.8.1
 
-Novidades da v0.7.9:
+Novidades da v0.8.1:
 - Aguarda e tenta montar armazenamento externo USB antes de cair para armazenamento local.
 - Procura armazenamento externo com PORACAM/config.txt em /media/*/* e /mnt/*.
 - Se encontrar config externo, usa esse config e salva em PORACAM/media quando media_dir não estiver definido.
@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 PROJECT_NAME = "poracam"
-PROJECT_VERSION = "0.7.9"
+PROJECT_VERSION = "0.8.1"
 
 # ============================================================
 # Developer/internal configuration
@@ -45,20 +45,35 @@ MAX_STORAGE_PERCENT = 95.0
 MIN_FREE_MB_BEFORE_RECORDING = 300
 STOP_SCHEDULING_WHEN_STORAGE_FULL = True
 
-# v0.7.9: wait briefly for USB storage at boot before falling back to local storage.
+# v0.8.1: production-oriented diagnostics.
+# Full metadata remains enabled by default while the system is still being validated.
+METADATA_ENABLED = True
+LIGHT_LOG_ENABLED = True
+TRASH_DETECTION_ENABLED = True
+TRASH_WARNING_MIN_MB = 50
+TRASH_DIR_NAMES = (".Trash", ".Trash-1000", ".Trashes", "$RECYCLE.BIN", "RECYCLER", "System Volume Information")
+
+# v0.8.1: optional time/date adjustment through a one-shot file on the USB drive.
+# File must be placed beside PORACAM/config.txt.
+TIME_SET_ENABLED = True
+TIME_SET_FILE_NAMES = ("SET_TIME.txt", "set_time.txt", "datetime.txt", "data_hora.txt")
+TIME_SET_DONE_FILE_NAME = "time_set_last_ok.txt"
+TIME_SET_ERROR_SUFFIX = ".error"
+
+# v0.8.1: wait briefly for USB storage at boot before falling back to local storage.
 # Balanced for short cycles: enough for USB enumeration, not so long that 1 min / 3 min cycles become too tight.
 EXTERNAL_CONFIG_WAIT_TIMEOUT_S = 30
 EXTERNAL_CONFIG_RETRY_INTERVAL_S = 2
 EXTERNAL_CONFIG_UDEV_SETTLE_TIMEOUT_S = 4
 EXTERNAL_CONFIG_TRY_MANUAL_MOUNT = True
 
-# v0.7.9: if external storage was selected, verify it is still mounted before recording
+# v0.8.1: if external storage was selected, verify it is still mounted before recording
 # and before writing metadata/status. This avoids writing to a stale /media directory
 # if the USB storage resets/disappears mid-cycle.
 EXTERNAL_STORAGE_VERIFY_BEFORE_RECORDING = True
 EXTERNAL_STORAGE_VERIFY_BEFORE_METADATA = True
 
-# v0.7.9: in autonomous/Witty Pi mode, never silently record to local SD
+# v0.8.1: in autonomous/Witty Pi mode, never silently record to local SD
 # when the PORACAM pendrive is missing. This prevents losing field data on the Pi.
 REQUIRE_EXTERNAL_STORAGE_IN_POWER_CONTROL = True
 
@@ -73,7 +88,7 @@ AUDIO_FORMAT = "S16_LE"
 AUDIO_RATE_HZ = 44100
 AUDIO_CHANNELS = 1
 
-# v0.7.9: Witty Pi usually starts Poracam as root/system.
+# v0.8.1: Witty Pi usually starts Poracam as root/system.
 # In that context ALSA PCM "default" may not exist, even if it works in an interactive shell.
 # "auto" probes default and then falls back to the first physical capture device from `arecord -l`.
 AUDIO_PROBE_SECONDS = 1
@@ -157,6 +172,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "prefer_external_storage": True,
     "allow_local_fallback": True,
     "require_external_storage_in_power_control": REQUIRE_EXTERNAL_STORAGE_IN_POWER_CONTROL,
+    "metadata_enabled": METADATA_ENABLED,
+    "light_log_enabled": LIGHT_LOG_ENABLED,
+    "trash_detection_enabled": TRASH_DETECTION_ENABLED,
+    "time_set_enabled": TIME_SET_ENABLED,
     "power_control_enabled": WITTYPI_POWER_CONTROL_ENABLED_BY_DEFAULT,
     "power_dry_run": False,
     "shutdown_after_recording": True,
@@ -171,7 +190,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 }
 
 # User-facing keys accepted in config.txt.
-# Technical parameters are intentionally not accepted from config.txt in v0.7.9.
+# Technical parameters are intentionally not accepted from config.txt in v0.8.1.
 CONFIG_KEY_ALIASES = {
     "session_name": "session_name",
     "record_duration_min": "record_duration_min",
@@ -749,6 +768,201 @@ def apply_user_config_to_runtime(config: Dict[str, Any]) -> Dict[str, Any]:
     return config
 
 
+
+def find_time_set_file(config_source: Optional[str], source_type: str) -> Optional[Path]:
+    """Find a one-shot time set command file beside PORACAM/config.txt."""
+    if not TIME_SET_ENABLED:
+        return None
+    if source_type != "external" or not config_source:
+        return None
+    config_path = Path(config_source)
+    poracam_root = config_path.parent
+    for name in TIME_SET_FILE_NAMES:
+        candidate = poracam_root / name
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    return None
+
+
+def parse_time_set_file(path: Path) -> str:
+    """
+    Read the first non-empty, non-comment line from the time set file.
+
+    Accepted examples:
+      2026-07-17 11:48:00 -04
+      2026-07-17 11:48:00 -0400
+      2026-07-17T11:48:00-04:00
+      2026-07-17 11:48:00
+    """
+    text = path.read_text(encoding="utf-8").splitlines()
+    for raw in text:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        # Also accept key=value style.
+        if "=" in line:
+            key, value = line.split("=", 1)
+            if key.strip().lower() in ("time", "datetime", "date_time", "data_hora", "data"):
+                line = value.strip()
+            else:
+                continue
+        return line
+    raise ValueError(f"Arquivo de data/hora vazio ou sem linha válida: {path}")
+
+
+def validate_time_set_value(value: str) -> str:
+    """
+    Validate and normalize a user-supplied datetime string for `date -s`.
+
+    This intentionally accepts a small set of explicit formats to avoid
+    accidental parsing of ambiguous dates.
+    """
+    raw = value.strip()
+    patterns = [
+        r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}$",
+        r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}\s*[+-]\d{2}$",
+        r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}\s*[+-]\d{4}$",
+        r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$",
+    ]
+    if not any(re.match(pattern, raw) for pattern in patterns):
+        raise ValueError(
+            "Formato de data/hora inválido. Use, por exemplo: "
+            "2026-07-17 11:48:00 -04"
+        )
+
+    # Basic semantic validation for the date/time part.
+    normalized_for_dt = raw.replace("T", " ")
+    dt_part = normalized_for_dt[:19]
+    dt.datetime.strptime(dt_part, "%Y-%m-%d %H:%M:%S")
+
+    return raw
+
+
+def detect_wittypi_dir(config: Dict[str, Any]) -> Optional[Path]:
+    configured = str(config.get("wittypi_dir", "") or "").strip()
+    candidates: List[str] = []
+    if configured:
+        candidates.append(configured)
+    candidates.extend(WITTYPI_DIR_CANDIDATES)
+
+    for candidate in candidates:
+        path = Path(candidate).expanduser()
+        if (path / "utilities.sh").exists():
+            return path.resolve()
+    return None
+
+
+def set_system_time_and_rtc(datetime_value: str, wittypi_dir: Optional[Path]) -> Tuple[bool, List[str]]:
+    """
+    Set Linux system time and, if available, write system time into Witty Pi RTC.
+    Returns (ok, messages).
+    """
+    messages: List[str] = []
+
+    # Stop NTP so it does not immediately fight the manual field time.
+    rc, out, err = run_quiet(["/usr/bin/timedatectl", "set-ntp", "false"], timeout_s=15)
+    messages.append(f"timedatectl set-ntp false: rc={rc}; msg={(out + err).strip()[-300:]}")
+    # Do not fail only because timedatectl is unavailable on a minimal image.
+
+    date_bin = shutil.which("date") or "/bin/date"
+    rc, out, err = run_quiet([date_bin, "-s", datetime_value], timeout_s=15)
+    messages.append(f"date -s: rc={rc}; msg={(out + err).strip()[-300:]}")
+    if rc != 0:
+        return False, messages
+
+    if wittypi_dir is not None:
+        utilities = wittypi_dir / "utilities.sh"
+        cmd = f'. "{utilities}"; system_to_rtc; check_sys_and_rtc_time'
+        rc, out, err = run_quiet(["/bin/bash", "-c", cmd], timeout_s=30)
+        messages.append(f"Witty Pi system_to_rtc: rc={rc}; msg={(out + err).strip()[-1000:]}")
+        if rc != 0:
+            return False, messages
+    else:
+        messages.append("Witty Pi utilities.sh não encontrado; RTC não foi atualizado.")
+        return False, messages
+
+    return True, messages
+
+
+def handle_time_set_command(config: Dict[str, Any], config_source: Optional[str], source_type: str, warnings: List[str]) -> List[str]:
+    """
+    Consume a one-shot USB time set file, if present.
+
+    Success policy:
+      - set system time;
+      - write system time to Witty Pi RTC;
+      - delete command file;
+      - write PORACAM/status/time_set_last_ok.txt.
+
+    Failure policy:
+      - keep evidence by renaming SET_TIME.txt to SET_TIME.txt.error when possible;
+      - append warning;
+      - continue normal Poracam flow.
+    """
+    time_file = find_time_set_file(config_source, source_type)
+    if time_file is None:
+        return warnings
+
+    poracam_root = time_file.parent
+    status_dir = poracam_root / "status"
+    try:
+        ensure_dir(status_dir)
+    except Exception:
+        pass
+
+    try:
+        raw_value = parse_time_set_file(time_file)
+        datetime_value = validate_time_set_value(raw_value)
+        wittypi_dir = detect_wittypi_dir(config)
+        ok, messages = set_system_time_and_rtc(datetime_value, wittypi_dir)
+
+        if not ok:
+            msg = "Falha ao aplicar SET_TIME: " + " | ".join(messages)
+            warnings.append(msg)
+            error_path = time_file.with_name(time_file.name + TIME_SET_ERROR_SUFFIX)
+            try:
+                if error_path.exists():
+                    error_path.unlink()
+                time_file.rename(error_path)
+                warnings.append(f"Arquivo de hora renomeado para indicar erro: {error_path}")
+            except Exception as rename_exc:
+                warnings.append(f"Não foi possível renomear arquivo de hora com erro: {rename_exc}")
+            return warnings
+
+        # Success: write acknowledgement then remove command file.
+        done_file = status_dir / TIME_SET_DONE_FILE_NAME
+        done_lines = [
+            f"Poracam time set: ok",
+            f"Applied at: {iso_now()}",
+            f"Requested datetime: {datetime_value}",
+            f"Command file consumed: {time_file}",
+            f"Witty Pi dir: {wittypi_dir}",
+            "Messages:",
+        ]
+        done_lines.extend(f"- {m}" for m in messages)
+        done_file.write_text("\n".join(done_lines) + "\n", encoding="utf-8")
+
+        try:
+            time_file.unlink()
+        except Exception as unlink_exc:
+            warnings.append(f"Hora aplicada, mas não foi possível apagar {time_file}: {unlink_exc}")
+
+        warnings.append(f"TIME SET OK: data/hora aplicada a partir de {time_file.name}; arquivo consumido.")
+        return warnings
+
+    except Exception as exc:
+        warnings.append(f"Falha ao processar arquivo de data/hora {time_file}: {exc}")
+        error_path = time_file.with_name(time_file.name + TIME_SET_ERROR_SUFFIX)
+        try:
+            if error_path.exists():
+                error_path.unlink()
+            time_file.rename(error_path)
+            warnings.append(f"Arquivo de hora renomeado para indicar erro: {error_path}")
+        except Exception as rename_exc:
+            warnings.append(f"Não foi possível renomear arquivo de hora com erro: {rename_exc}")
+        return warnings
+
+
 def merge_config(args: argparse.Namespace) -> Tuple[Dict[str, Any], Optional[str], str, bool, List[str]]:
     final_config = dict(DEFAULT_CONFIG)
     config_path, source_type, external_used, warnings = determine_config_path(args)
@@ -886,7 +1100,7 @@ def resolve_audio_device(config: Dict[str, Any], log_file: Path) -> Dict[str, An
     """
     Resolve the audio capture device with retry.
 
-    v0.7.9 rationale:
+    v0.8.1 rationale:
     after Witty Pi powers the Raspberry, the USB audio interface may not be immediately
     enumerated by ALSA. A single `arecord -l`/probe attempt can fail in the first seconds
     of boot even though the device becomes available shortly after.
@@ -1178,16 +1392,143 @@ def get_storage_info(path: Path) -> Dict[str, Any]:
     }
 
 
+
+def directory_size_bytes(path: Path) -> int:
+    total = 0
+    if not path.exists():
+        return 0
+    if path.is_file():
+        try:
+            return path.stat().st_size
+        except Exception:
+            return 0
+    try:
+        for item in path.rglob("*"):
+            try:
+                if item.is_file():
+                    total += item.stat().st_size
+            except Exception:
+                continue
+    except Exception:
+        return total
+    return total
+
+
+def find_trash_usage(storage_root: Path) -> List[Dict[str, Any]]:
+    """Find common Linux/macOS/Windows trash directories on the storage root."""
+    results: List[Dict[str, Any]] = []
+    try:
+        root = Path(storage_root).expanduser().resolve()
+    except Exception:
+        root = Path(storage_root)
+
+    candidates: List[Path] = []
+    for name in TRASH_DIR_NAMES:
+        candidates.append(root / name)
+
+    # Also catch .Trash-1000, .Trash-1001, etc.
+    try:
+        for child in root.iterdir():
+            if child.name.startswith(".Trash-") and child not in candidates:
+                candidates.append(child)
+    except Exception:
+        pass
+
+    seen = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        if candidate.exists():
+            size_b = directory_size_bytes(candidate)
+            results.append({
+                "path": str(candidate),
+                "size_bytes": size_b,
+                "size_mb": round(size_b / (1024 * 1024), 3),
+            })
+
+    results.sort(key=lambda item: item.get("size_bytes", 0), reverse=True)
+    return results
+
+
+def storage_root_for_path(path: Path) -> Path:
+    """Return the mount/storage root associated with media_dir/PORACAM path."""
+    current = Path(path).expanduser().resolve()
+    if current.name == "media" and current.parent.name == "PORACAM":
+        return current.parent.parent
+    if current.name == "PORACAM":
+        return current.parent
+    for parent in current.parents:
+        if parent.name == "PORACAM":
+            return parent.parent
+    return current
+
+
+def enrich_storage_with_trash(info: Dict[str, Any], media_dir: Path) -> Dict[str, Any]:
+    if not TRASH_DETECTION_ENABLED:
+        return info
+    enriched = dict(info)
+    root = storage_root_for_path(media_dir)
+    trash = find_trash_usage(root)
+    trash_total_b = sum(int(item.get("size_bytes", 0)) for item in trash)
+    enriched["storage_root"] = str(root)
+    enriched["trash"] = trash
+    enriched["trash_total_bytes"] = trash_total_b
+    enriched["trash_total_mb"] = round(trash_total_b / (1024 * 1024), 3)
+    if enriched["trash_total_mb"] >= TRASH_WARNING_MIN_MB:
+        enriched["trash_warning"] = (
+            f"Lixeira do armazenamento ocupa {enriched['trash_total_mb']} MB. "
+            "Esvazie a lixeira do pendrive ou use o script LIMPAR_PORACAM."
+        )
+    return enriched
+
+
+def append_light_log(light_log_file: Path, event: str, **fields: Any) -> None:
+    if not LIGHT_LOG_ENABLED:
+        return
+    try:
+        ensure_dir(light_log_file.parent)
+        parts = [iso_now(), event]
+        for key, value in fields.items():
+            if value is None:
+                continue
+            text = str(value).replace("\n", " ").replace("\r", " ")
+            parts.append(f"{key}={text}")
+        with light_log_file.open("a", encoding="utf-8") as f:
+            f.write(" ".join(parts) + "\n")
+    except Exception:
+        pass
+
+
+def write_metadata_file(path: Path, metadata: Dict[str, Any], log_file: Optional[Path] = None) -> None:
+    if not METADATA_ENABLED:
+        if log_file is not None:
+            append_log(log_file, "Metadata disabled by METADATA_ENABLED=False; JSON not written.")
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2, ensure_ascii=False)
+
+
 def check_storage_or_fail(path: Path, max_storage_percent: float) -> Dict[str, Any]:
-    info = get_storage_info(path)
+    info = enrich_storage_with_trash(get_storage_info(path), path)
+    trash_msg = ""
+    if info.get("trash_total_mb", 0) >= TRASH_WARNING_MIN_MB:
+        trash_msg = (
+            f" Possível causa: lixeira ocupa {info.get('trash_total_mb')} MB "
+            f"em {info.get('storage_root')}."
+        )
     if info["used_percent"] >= max_storage_percent:
         raise StorageFullError(
-            f"Uso do armazenamento acima do limite: {info['used_percent']}% usado, limite={max_storage_percent}%"
+            f"Uso do armazenamento acima do limite: {info['used_percent']}% usado, limite={max_storage_percent}%."
+            + trash_msg
         )
     if float(info["free_mb"]) < float(MIN_FREE_MB_BEFORE_RECORDING):
         raise StorageFullError(
             "Espaço livre abaixo do mínimo para iniciar gravação: "
-            f"{info['free_mb']} MB livre, mínimo={MIN_FREE_MB_BEFORE_RECORDING} MB"
+            f"{info['free_mb']} MB livre, mínimo={MIN_FREE_MB_BEFORE_RECORDING} MB."
+            + trash_msg
         )
     return info
 
@@ -1212,7 +1553,7 @@ def validate_config(config: Dict[str, Any]) -> None:
     if int(config["cycle_period_s"]) < int(config["duration"]):
         raise ValueError(f"cycle_period_s precisa ser maior ou igual a record_duration_s/duration. Recebido: cycle_period_s={config['cycle_period_s']}, duration={config['duration']}")
     if str(config["run_mode"]).lower() != "single":
-        raise ValueError(f"Na v0.7.9, apenas run_mode=single é suportado. Recebido: run_mode={config['run_mode']}")
+        raise ValueError(f"Na v0.8.1, apenas run_mode=single é suportado. Recebido: run_mode={config['run_mode']}")
     for key in ("width", "height", "fps", "bitrate"):
         if int(config[key]) <= 0:
             raise ValueError(f"{key} precisa ser maior que zero.")
@@ -1271,6 +1612,11 @@ def write_status_files(status_dir: Path, metadata: Dict[str, Any], status: str, 
         f"Audio: {metadata.get('paths', {}).get('audio_wav')}",
         f"Metadata: {metadata.get('paths', {}).get('metadata')}",
     ]
+    storage_before = metadata.get("storage", {}).get("before") or {}
+    storage_after = metadata.get("storage", {}).get("after") or {}
+    trash_warning = storage_after.get("trash_warning") or storage_before.get("trash_warning")
+    if trash_warning:
+        lines.append(f"Aviso armazenamento: {trash_warning}")
     if error_message:
         lines.append(f"Erro: {error_message}")
     with status_txt_file.open("w", encoding="utf-8") as f:
@@ -1751,10 +2097,12 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
     temp_dir = media_dir / "temp"
     log_dir = media_dir / "logs"
     metadata_dir = media_dir / "metadata"
-    for directory in [video_dir, audio_dir, temp_dir, log_dir, metadata_dir, status_dir]:
+    light_log_dir = poracam_root / "logs"
+    for directory in [video_dir, audio_dir, temp_dir, log_dir, metadata_dir, status_dir, light_log_dir]:
         ensure_dir(directory)
 
     log_file = log_dir / f"{stamp}_poracam.log"
+    light_log_file = light_log_dir / f"poracam_{dt.datetime.now().strftime('%Y%m%d')}.log"
     metadata_file = metadata_dir / f"{stamp}_metadata.json"
 
     status = "unknown"
@@ -1799,6 +2147,7 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
             "audio_wav": str(first_audio_wav),
             "temp_h264": str(first_temp_h264),
             "log": str(log_file),
+            "light_log": str(light_log_file),
             "metadata": str(metadata_file),
         },
         "settings": {
@@ -1872,6 +2221,15 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
         append_log(log_file, f"Config source: {config_source or 'internal defaults / CLI only'}")
         append_log(log_file, f"Config source type: {config_source_type}")
         append_log(log_file, f"External storage used: {external_storage_used}")
+        append_light_log(
+            light_log_file,
+            "START",
+            version=PROJECT_VERSION,
+            session=session_name,
+            config_source_type=config_source_type,
+            external_storage=external_storage_used,
+            media_dir=media_dir,
+        )
         for warning in config_warnings:
             append_log(log_file, f"CONFIG WARNING: {warning}")
 
@@ -1891,6 +2249,9 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
         storage_before = check_storage_or_fail(media_dir, float(config["max_storage_percent"]))
         timing["storage_check_s"] = round(time.monotonic() - storage_t0, 3)
         append_log(log_file, f"Storage before recording: {storage_before['used_percent']}% used, {storage_before['free_mb']} MB free")
+        if storage_before.get("trash_warning"):
+            append_log(log_file, f"STORAGE WARNING: {storage_before.get('trash_warning')}")
+            append_light_log(light_log_file, "STORAGE_WARNING", warning=storage_before.get("trash_warning"))
 
         camera_t0 = time.monotonic()
         camera_conflicts = handle_camera_conflicts(config, log_file)
@@ -2015,9 +2376,7 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
                     f"Recovery local: {recovery_path or 'falhou'}"
                 )
 
-        metadata_file.parent.mkdir(parents=True, exist_ok=True)
-        with metadata_file.open("w", encoding="utf-8") as f:
-            json.dump(metadata, f, indent=2, ensure_ascii=False)
+        write_metadata_file(metadata_file, metadata, log_file)
         try:
             write_status_files(status_dir, metadata, status, error_message)
         except Exception as status_exc:
@@ -2027,9 +2386,7 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
         try:
             power_info = perform_power_control(config, status, start_epoch, log_file)
             metadata["power"] = power_info
-            metadata_file.parent.mkdir(parents=True, exist_ok=True)
-            with metadata_file.open("w", encoding="utf-8") as f:
-                json.dump(metadata, f, indent=2, ensure_ascii=False)
+            write_metadata_file(metadata_file, metadata, log_file)
             try:
                 write_status_files(status_dir, metadata, status, error_message)
             except Exception as status_exc:
@@ -2038,19 +2395,28 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
         except Exception as power_exc:
             append_log(log_file, f"POWER ERROR: unexpected failure: {power_exc}")
             metadata["power"] = {"enabled": bool(config.get("power_control_enabled", False)), "error": str(power_exc)}
-            metadata_file.parent.mkdir(parents=True, exist_ok=True)
-            with metadata_file.open("w", encoding="utf-8") as f:
-                json.dump(metadata, f, indent=2, ensure_ascii=False)
+            write_metadata_file(metadata_file, metadata, log_file)
 
-        append_log(log_file, f"Metadata saved: {metadata_file}")
+        append_log(log_file, f"Metadata saved: {metadata_file if METADATA_ENABLED else 'disabled'}")
         append_log(log_file, f"Final status: {status}")
         append_log(log_file, f"Total elapsed: {timing['total_s']} s")
+        append_light_log(
+            light_log_file,
+            "END",
+            status=status,
+            error=error_message,
+            video=metadata.get("paths", {}).get("video_mp4"),
+            audio=metadata.get("paths", {}).get("audio_wav"),
+            total_s=timing.get("total_s"),
+            free_mb=(storage_after or storage_before or {}).get("free_mb") if (storage_after or storage_before) else None,
+            next_startup=(metadata.get("power") or {}).get("next_startup_time"),
+        )
     return 0 if status == "ok" else 1
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Poracam v0.7.9: balanced + pendrive obrigatório em power-control + Witty Pi."
+        description="Poracam v0.8.1: ajuste de hora por USB + audio mono + light log + trash detection."
     )
 
     parser.add_argument(
@@ -2072,7 +2438,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     # Developer/installation flags. Not intended for the end-user config.txt.
     parser.add_argument("--power-control", action="store_true", help="Ativa agendamento Witty Pi + shutdown ao final da gravação.")
-    parser.add_argument("--no-power-control", action="store_true", help="Desativa controle de energia, mesmo na v0.7.9.")
+    parser.add_argument("--no-power-control", action="store_true", help="Desativa controle de energia, mesmo na v0.8.1.")
     parser.add_argument("--power-dry-run", action="store_true", help="Simula agendamento/shutdown sem escrever no Witty Pi nem desligar.")
     parser.add_argument("--wittypi-dir", default=None, help="Diretório do Witty Pi contendo utilities.sh.")
 
@@ -2085,6 +2451,7 @@ def main() -> int:
     args = parser.parse_args()
     try:
         config, config_source, source_type, external_used, warnings = merge_config(args)
+        warnings = handle_time_set_command(config, config_source, source_type, warnings)
         return record(config, config_source, source_type, external_used, warnings)
     except Exception as exc:
         print(f"Erro: {exc}", file=sys.stderr)
