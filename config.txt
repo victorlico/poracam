@@ -1,4 +1,4 @@
-# config.txt — Poracam v0.8.1
+# config.txt — Poracam v0.8.2
 # Interface simples para usuário final.
 #
 # Edite apenas os campos abaixo.
