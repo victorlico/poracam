@@ -1,7 +1,7 @@
 #!/bin/bash
 # file: poracam_wittypi_power.sh
 #
-# Helper used by Poracam v0.8.2 to integrate with Witty Pi utilities.sh.
+# Helper used by Poracam v0.8.3 to integrate with Witty Pi utilities.sh.
 #
 # Actions:
 #   schedule-startup --target-epoch <epoch>

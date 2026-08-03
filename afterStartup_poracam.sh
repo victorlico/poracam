@@ -1,7 +1,7 @@
 #!/bin/bash
 # file: afterStartup.sh
 #
-# Suggested Witty Pi afterStartup.sh for Poracam v0.8.2.
+# Suggested Witty Pi afterStartup.sh for Poracam v0.8.3.
 #
 # It launches Poracam in the background and returns quickly so Witty Pi daemon.sh
 # can finish its startup sequence and send SYS_UP. Poracam itself will schedule
@@ -13,7 +13,7 @@ LOG="$PORACAM_DIR/poracam_afterStartup.log"
 
 mkdir -p "$PORACAM_DIR"
 
-echo "$(date '+%F %T') [afterStartup] launching Poracam v0.8.2" >> "$LOG"
+echo "$(date '+%F %T') [afterStartup] launching Poracam v0.8.3" >> "$LOG"
 
 if [ ! -x "$PORACAM_SCRIPT" ]; then
   echo "$(date '+%F %T') [afterStartup] ERROR: script not executable: $PORACAM_SCRIPT" >> "$LOG"
