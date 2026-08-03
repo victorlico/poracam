@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-poracam_record.py — Poracam v0.8.3
+poracam_record.py — Poracam v0.8.3.2
 
-Novidades da v0.8.3:
+Novidades da v0.8.3.2:
 - Aguarda e tenta montar armazenamento externo USB antes de cair para armazenamento local.
 - Procura armazenamento externo com PORACAM/config.txt em /media/*/* e /mnt/*.
 - Se encontrar config externo, usa esse config e salva em PORACAM/media quando media_dir não estiver definido.
@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 PROJECT_NAME = "poracam"
-PROJECT_VERSION = "0.8.3"
+PROJECT_VERSION = "0.8.3.2"
 
 # ============================================================
 # Developer/internal configuration
@@ -45,7 +45,7 @@ MAX_STORAGE_PERCENT = 95.0
 MIN_FREE_MB_BEFORE_RECORDING = 300
 STOP_SCHEDULING_WHEN_STORAGE_FULL = True
 
-# v0.8.3: production-oriented diagnostics.
+# v0.8.3.2: production-oriented diagnostics.
 # Full metadata remains enabled by default while the system is still being validated.
 METADATA_ENABLED = False
 LIGHT_LOG_ENABLED = True
@@ -53,14 +53,14 @@ TRASH_DETECTION_ENABLED = True
 TRASH_WARNING_MIN_MB = 50
 TRASH_DIR_NAMES = (".Trash", ".Trash-1000", ".Trashes", "$RECYCLE.BIN", "RECYCLER", "System Volume Information")
 
-# v0.8.3: optional time/date adjustment through a one-shot file on the USB drive.
+# v0.8.3.2: optional time/date adjustment through a one-shot file on the USB drive.
 # File must be placed beside PORACAM/config.txt.
 TIME_SET_ENABLED = True
 TIME_SET_FILE_NAMES = ("SET_TIME.txt", "set_time.txt", "datetime.txt", "data_hora.txt")
 TIME_SET_DONE_FILE_NAME = "time_set_last_ok.txt"
 TIME_SET_ERROR_SUFFIX = ".error"
 
-# v0.8.3: initial campaign check and LED status.
+# v0.8.3.2: initial campaign check and LED status.
 FIELD_CHECK_ENABLED = True
 FIELD_CHECK_DURATION_S = 30
 READY_STATUS_FILE_NAME = "PRONTO_PARA_CAMPO.txt"
@@ -68,23 +68,23 @@ LED_STATUS_ENABLED = True
 LED_NAME = "led0"
 LED_OK_BRIGHTNESS = "1"
 LED_OFF_BRIGHTNESS = "0"
-LED_CHECK_DELAY_MS = 500
+LED_CHECK_DELAY_MS = 1000
 LED_ERROR_DELAY_MS = 120
 
-# v0.8.3: wait briefly for USB storage at boot before falling back to local storage.
+# v0.8.3.2: wait briefly for USB storage at boot before falling back to local storage.
 # Balanced for short cycles: enough for USB enumeration, not so long that 1 min / 3 min cycles become too tight.
 EXTERNAL_CONFIG_WAIT_TIMEOUT_S = 30
 EXTERNAL_CONFIG_RETRY_INTERVAL_S = 2
 EXTERNAL_CONFIG_UDEV_SETTLE_TIMEOUT_S = 4
 EXTERNAL_CONFIG_TRY_MANUAL_MOUNT = True
 
-# v0.8.3: if external storage was selected, verify it is still mounted before recording
+# v0.8.3.2: if external storage was selected, verify it is still mounted before recording
 # and before writing metadata/status. This avoids writing to a stale /media directory
 # if the USB storage resets/disappears mid-cycle.
 EXTERNAL_STORAGE_VERIFY_BEFORE_RECORDING = True
 EXTERNAL_STORAGE_VERIFY_BEFORE_METADATA = True
 
-# v0.8.3: in autonomous/Witty Pi mode, never silently record to local SD
+# v0.8.3.2: in autonomous/Witty Pi mode, never silently record to local SD
 # when the PORACAM pendrive is missing. This prevents losing field data on the Pi.
 REQUIRE_EXTERNAL_STORAGE_IN_POWER_CONTROL = True
 
@@ -99,7 +99,7 @@ AUDIO_FORMAT = "S16_LE"
 AUDIO_RATE_HZ = 44100
 AUDIO_CHANNELS = 1
 
-# v0.8.3: Witty Pi usually starts Poracam as root/system.
+# v0.8.3.2: Witty Pi usually starts Poracam as root/system.
 # In that context ALSA PCM "default" may not exist, even if it works in an interactive shell.
 # "auto" probes default and then falls back to the first physical capture device from `arecord -l`.
 AUDIO_PROBE_SECONDS = 1
@@ -202,7 +202,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 }
 
 # User-facing keys accepted in config.txt.
-# Technical parameters are intentionally not accepted from config.txt in v0.8.3.
+# Technical parameters are intentionally not accepted from config.txt in v0.8.3.2.
 CONFIG_KEY_ALIASES = {
     "session_name": "session_name",
     "record_duration_min": "record_duration_min",
@@ -883,6 +883,40 @@ def consume_or_mark_time_file_after_check(config: Dict[str, Any], ok: bool, warn
             warnings.append(f"Checklist falhou; nao foi possivel renomear arquivo de hora: {exc}")
 
 
+
+def write_field_check_failure_status(
+    *,
+    status_dir: Path,
+    config: Dict[str, Any],
+    config_source_type: str,
+    external_storage_used: bool,
+    storage_info: Optional[Dict[str, Any]],
+    audio_resolution: Optional[Dict[str, Any]],
+    error_message: str,
+    action: str = "Nao fechar o case. Corrigir o problema indicado, desligar a alimentacao e reiniciar o equipamento.",
+) -> None:
+    checks = build_basic_ready_checks(
+        config_source_type=config_source_type,
+        external_storage_used=external_storage_used,
+        storage_info=storage_info,
+        audio_resolution=audio_resolution,
+    )
+    if config.get("_poracam_field_check_requested"):
+        checks.append((
+            "Ajuste de data/hora por SET_TIME.txt",
+            bool(config.get("_poracam_time_set_ok", False)),
+            str(config.get("_poracam_time_set_requested_datetime", "")),
+        ))
+    write_ready_status_file(
+        status_dir,
+        False,
+        PROJECT_VERSION,
+        checks,
+        action,
+        error_message,
+    )
+
+
 def build_basic_ready_checks(
     config_source_type: str,
     external_storage_used: bool,
@@ -1022,7 +1056,7 @@ def handle_time_set_command(config: Dict[str, Any], config_source: Optional[str]
     """
     Process a one-shot USB time set file, if present.
 
-    In v0.8.3, SET_TIME.txt also marks the beginning of a new campaign:
+    In v0.8.3.2, SET_TIME.txt also marks the beginning of a new campaign:
       - set system time;
       - write system time to Witty Pi RTC;
       - request a short field check recording;
@@ -1234,7 +1268,7 @@ def resolve_audio_device(config: Dict[str, Any], log_file: Path) -> Dict[str, An
     """
     Resolve the audio capture device with retry.
 
-    v0.8.3 rationale:
+    v0.8.3.2 rationale:
     after Witty Pi powers the Raspberry, the USB audio interface may not be immediately
     enumerated by ALSA. A single `arecord -l`/probe attempt can fail in the first seconds
     of boot even though the device becomes available shortly after.
@@ -1691,7 +1725,7 @@ def validate_config(config: Dict[str, Any]) -> None:
     if int(config["cycle_period_s"]) < int(config["duration"]):
         raise ValueError(f"cycle_period_s precisa ser maior ou igual a record_duration_s/duration. Recebido: cycle_period_s={config['cycle_period_s']}, duration={config['duration']}")
     if str(config["run_mode"]).lower() != "single":
-        raise ValueError(f"Na v0.8.3, apenas run_mode=single é suportado. Recebido: run_mode={config['run_mode']}")
+        raise ValueError(f"Na v0.8.3.2, apenas run_mode=single é suportado. Recebido: run_mode={config['run_mode']}")
     for key in ("width", "height", "fps", "bitrate"):
         if int(config[key]) <= 0:
             raise ValueError(f"{key} precisa ser maior que zero.")
@@ -1730,7 +1764,7 @@ def write_status_files(status_dir: Path, metadata: Dict[str, Any], status: str, 
         "last_end_time": metadata.get("end_time"),
         "video_mp4": metadata.get("paths", {}).get("video_mp4"),
         "audio_wav": metadata.get("paths", {}).get("audio_wav"),
-        "metadata": metadata.get("paths", {}).get("metadata"),
+        "metadata": metadata.get("paths", {}).get("metadata") if metadata.get("settings", {}).get("metadata_enabled", True) else "desabilitado",
         "config_source": metadata.get("config_source"),
         "config_source_type": metadata.get("config_source_type"),
         "external_storage_used": metadata.get("external_storage_used"),
@@ -2403,7 +2437,19 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
                 "Fallback local bloqueado; gravação não iniciada."
             )
 
-        audio_resolution = resolve_audio_device(config, log_file)
+        try:
+            audio_resolution = resolve_audio_device(config, log_file)
+        except Exception as audio_exc:
+            audio_resolution = {
+                "requested": str(config.get("audio_device")),
+                "selected": None,
+                "method": "failed",
+                "error": str(audio_exc),
+            }
+            metadata["audio"] = audio_resolution
+            if field_check_requested:
+                raise FieldCheckError(str(audio_exc))
+            raise
         metadata["audio"] = audio_resolution
         metadata["settings"]["audio_device"] = str(config["audio_device"])
         append_log(log_file, f"Audio device requested: {audio_resolution.get('requested')}")
@@ -2539,12 +2585,25 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
         config["_poracam_stop_scheduling"] = True
         config["_poracam_stop_scheduling_reason"] = stop_scheduling_reason
         config["shutdown_after_recording"] = False
-        append_log(log_file, f"FIELD CHECK ERROR: {error_message}")
-        append_log(log_file, "POWER: field check failed; next startup will not be scheduled and shutdown will be skipped for LED indication.")
+        consume_or_mark_time_file_after_check(config, False, config_warnings)
         try:
             storage_after = get_storage_info(media_dir)
         except Exception:
-            storage_after = None
+            storage_after = storage_before
+        try:
+            write_field_check_failure_status(
+                status_dir=status_dir,
+                config=config,
+                config_source_type=config_source_type,
+                external_storage_used=external_storage_used,
+                storage_info=storage_after or storage_before,
+                audio_resolution=audio_resolution,
+                error_message=error_message,
+            )
+        except Exception as ready_exc:
+            append_log(log_file, f"WARNING: failed to write ready failure status: {ready_exc}")
+        append_log(log_file, f"FIELD CHECK ERROR: {error_message}")
+        append_log(log_file, "POWER: field check failed; next startup will not be scheduled and shutdown will be skipped for LED indication.")
 
     except StorageFullError as exc:
         status = "error"
@@ -2566,6 +2625,22 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
         stop_scheduling_reason = "external_storage_missing"
         config["_poracam_stop_scheduling"] = True
         config["_poracam_stop_scheduling_reason"] = stop_scheduling_reason
+        if field_check_requested:
+            field_check_failure = True
+            config["shutdown_after_recording"] = False
+            consume_or_mark_time_file_after_check(config, False, config_warnings)
+            try:
+                write_field_check_failure_status(
+                    status_dir=status_dir,
+                    config=config,
+                    config_source_type=config_source_type,
+                    external_storage_used=external_storage_used,
+                    storage_info=storage_before,
+                    audio_resolution=audio_resolution,
+                    error_message=error_message,
+                )
+            except Exception as ready_exc:
+                append_log(log_file, f"WARNING: failed to write ready failure status: {ready_exc}")
         append_log(log_file, f"ERROR: {error_message}")
         append_log(log_file, "POWER: external storage missing; next startup will not be scheduled.")
 
@@ -2578,11 +2653,25 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
             config["_poracam_stop_scheduling"] = True
             config["_poracam_stop_scheduling_reason"] = stop_scheduling_reason
             config["shutdown_after_recording"] = False
+            consume_or_mark_time_file_after_check(config, False, config_warnings)
         append_log(log_file, f"ERROR: {error_message}")
         try:
             storage_after = get_storage_info(media_dir)
         except Exception:
-            storage_after = None
+            storage_after = storage_before
+        if field_check_requested:
+            try:
+                write_field_check_failure_status(
+                    status_dir=status_dir,
+                    config=config,
+                    config_source_type=config_source_type,
+                    external_storage_used=external_storage_used,
+                    storage_info=storage_after or storage_before,
+                    audio_resolution=audio_resolution,
+                    error_message=error_message,
+                )
+            except Exception as ready_exc:
+                append_log(log_file, f"WARNING: failed to write ready failure status: {ready_exc}")
 
     finally:
         end_iso = iso_now()
@@ -2675,12 +2764,16 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
             free_mb=(storage_after or storage_before or {}).get("free_mb") if (storage_after or storage_before) else None,
             next_startup=(metadata.get("power") or {}).get("next_startup_time"),
         )
+        try:
+            sync_filesystem(log_file)
+        except Exception as sync_exc:
+            append_log(log_file, f"WARNING: final sync failed: {sync_exc}")
     return 0 if status == "ok" else 1
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Poracam v0.8.3: SET_TIME com checklist de campo e LED de status."
+        description="Poracam v0.8.3.2: correção do erro de checklist antes da gravação curta."
     )
 
     parser.add_argument(
@@ -2702,7 +2795,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     # Developer/installation flags. Not intended for the end-user config.txt.
     parser.add_argument("--power-control", action="store_true", help="Ativa agendamento Witty Pi + shutdown ao final da gravação.")
-    parser.add_argument("--no-power-control", action="store_true", help="Desativa controle de energia, mesmo na v0.8.3.")
+    parser.add_argument("--no-power-control", action="store_true", help="Desativa controle de energia, mesmo na v0.8.3.2.")
     parser.add_argument("--power-dry-run", action="store_true", help="Simula agendamento/shutdown sem escrever no Witty Pi nem desligar.")
     parser.add_argument("--wittypi-dir", default=None, help="Diretório do Witty Pi contendo utilities.sh.")
 
