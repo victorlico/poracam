@@ -1,29 +1,18 @@
 #!/bin/bash
 # file: beforeShutdown.sh
 #
-# Defensive Witty Pi beforeShutdown.sh for Poracam v0.8.3.2.
+# Poracam v0.8.3.2 - Witty Pi shutdown hook
 #
-# This script is executed by Witty Pi daemon.sh after GPIO-4 is pulled LOW
-# and before Linux shutdown is requested.
+# IMPORTANT:
+# Poracam already runs sync before triggering the Witty Pi shutdown path.
+# Do not run another sync here: beforeShutdown.sh is synchronous inside
+# daemon.sh, so any storage stall here prevents do_shutdown() from running.
 #
-# Poracam already syncs its files before requesting shutdown. This script
-# performs one bounded final sync so storage cannot block shutdown forever.
+# This hook only records that the official Witty Pi shutdown path was reached.
 
 LOG="/home/fishcam/poracam/poracam_beforeShutdown.log"
-SYNC_TIMEOUT_SECONDS=20
 
 mkdir -p "$(dirname "$LOG")"
+echo "$(date '+%F %T') [beforeShutdown] Witty Pi shutdown path reached; no extra sync required" >> "$LOG"
 
-echo "$(date '+%F %T') [beforeShutdown] Witty Pi shutdown path reached" >> "$LOG"
-echo "$(date '+%F %T') [beforeShutdown] final sync start (timeout=${SYNC_TIMEOUT_SECONDS}s)" >> "$LOG"
-
-if timeout "${SYNC_TIMEOUT_SECONDS}s" sync; then
-    RC=0
-    echo "$(date '+%F %T') [beforeShutdown] final sync done rc=0" >> "$LOG"
-else
-    RC=$?
-    echo "$(date '+%F %T') [beforeShutdown] WARNING: final sync ended rc=$RC" >> "$LOG"
-fi
-
-# Never block Witty Pi shutdown because of the defensive sync.
 exit 0
