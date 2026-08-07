@@ -2137,14 +2137,18 @@ def run_power_wrapper(
     return result
 
 
-def perform_power_control(
+def prepare_power_control(
     config: Dict[str, Any],
     status: str,
     recording_start_epoch: int,
     log_file: Path,
 ) -> Dict[str, Any]:
     """
-    Schedule next Witty Pi startup and optionally request shutdown.
+    Schedule the next Witty Pi startup, but DO NOT request shutdown yet.
+
+    Shutdown is intentionally deferred until every Poracam file/status/log write
+    has finished. The actual GPIO-4 shutdown trigger is performed later by
+    execute_terminal_shutdown(), which is the terminal action of the process.
 
     The next startup is based on recording_start_epoch + cycle_period_s, not on
     end-of-processing time.
@@ -2185,6 +2189,8 @@ def perform_power_control(
         "schedule_result": None,
         "shutdown_result": None,
         "shutdown_requested": False,
+        "shutdown_pending": False,
+        "shutdown_request_mode": "terminal_exec",
         "shutdown_skipped_reason": None,
     }
 
@@ -2227,24 +2233,108 @@ def perform_power_control(
         append_log(log_file, "POWER: startup schedule failed; shutdown skipped to avoid losing recovery.")
         return power
 
-    if shutdown_delay_s > 0:
-        append_log(log_file, f"POWER: waiting {shutdown_delay_s}s before shutdown request.")
-        time.sleep(shutdown_delay_s)
-
-    shutdown_result = run_power_wrapper(
-        action="shutdown",
-        target_epoch=None,
-        wittypi_dir=wittypi_dir,
-        dry_run=dry_run,
-        log_file=log_file,
+    # Important: only mark shutdown as pending here. No GPIO is touched yet.
+    # The trigger must happen after metadata/status/light-log/final sync.
+    power["shutdown_pending"] = True
+    append_log(
+        log_file,
+        "POWER: startup scheduling complete; shutdown deferred until all Poracam writes are finalized.",
     )
-    power["shutdown_result"] = shutdown_result
-    power["shutdown_requested"] = bool(shutdown_result.get("ok"))
-    if not power["shutdown_requested"]:
-        power["shutdown_skipped_reason"] = "shutdown_wrapper_failed"
-
     return power
 
+
+def execute_terminal_shutdown(
+    config: Dict[str, Any],
+    power: Optional[Dict[str, Any]],
+    log_file: Path,
+) -> bool:
+    """
+    Execute shutdown as the terminal Poracam action.
+
+    For a real shutdown this function deliberately uses os.execv() to replace
+    the Python process with poracam_wittypi_power.sh. Therefore, after the
+    Witty Pi GPIO-4 trigger is issued successfully, no Python finally block,
+    metadata write, status write, LED update, log append or sync can run.
+
+    Returns only when no real shutdown is requested, in dry-run mode, or if the
+    terminal exec fails before the wrapper can be started.
+    """
+    if not power or not bool(power.get("shutdown_pending", False)):
+        return False
+
+    dry_run = bool(power.get("dry_run", False))
+    shutdown_delay_s = int(power.get("shutdown_delay_s", config.get("shutdown_delay_s", SHUTDOWN_DELAY_S)))
+
+    wittypi_dir_raw = power.get("wittypi_dir")
+    wittypi_dir = Path(str(wittypi_dir_raw)) if wittypi_dir_raw else find_wittypi_dir(config)
+
+    if dry_run:
+        append_log(log_file, "POWER: terminal shutdown dry-run; GPIO-4 will not be triggered.")
+        result = run_power_wrapper(
+            action="shutdown",
+            target_epoch=None,
+            wittypi_dir=wittypi_dir,
+            dry_run=True,
+            log_file=log_file,
+        )
+        power["shutdown_result"] = result
+        power["shutdown_requested"] = bool(result.get("ok"))
+        if not power["shutdown_requested"]:
+            power["shutdown_skipped_reason"] = "shutdown_wrapper_failed"
+        return power["shutdown_requested"]
+
+    script = find_power_script()
+    if script is None:
+        power["shutdown_skipped_reason"] = "shutdown_wrapper_missing"
+        append_log(log_file, f"POWER ERROR: {WITTYPI_POWER_SCRIPT_NAME} not found; terminal shutdown skipped.")
+        return False
+
+    if wittypi_dir is None:
+        power["shutdown_skipped_reason"] = "wittypi_dir_missing"
+        append_log(log_file, "POWER ERROR: Witty Pi directory not found; terminal shutdown skipped.")
+        return False
+
+    # Everything that needs persistence must be written BEFORE this point.
+    append_log(
+        log_file,
+        "POWER: all Poracam writes finalized; performing final filesystem sync before terminal shutdown.",
+    )
+    if shutdown_delay_s > 0:
+        append_log(
+            log_file,
+            f"POWER: terminal shutdown armed; GPIO-4 will be triggered after {shutdown_delay_s}s with no further Poracam writes.",
+        )
+
+    # Final filesystem flush. Do not log anything after a successful os.sync().
+    try:
+        os.sync()
+    except AttributeError:
+        # Python/Linux normally provides os.sync(). Fallback is intentionally
+        # silent because writing a post-sync log would dirty the filesystem again.
+        subprocess.run(["sync"], check=False)
+    except Exception:
+        # Same principle: keep the shutdown path terminal and avoid new disk I/O.
+        subprocess.run(["sync"], check=False)
+
+    if shutdown_delay_s > 0:
+        time.sleep(shutdown_delay_s)
+
+    argv = [str(script), "shutdown", "--wittypi-dir", str(wittypi_dir)]
+
+    try:
+        # Successful exec never returns. The wrapper becomes the current process.
+        os.execv(str(script), argv)
+    except Exception as exc:
+        # Safe to log here: exec failed, so GPIO-4 was not triggered by this call.
+        power["shutdown_skipped_reason"] = "terminal_exec_failed"
+        power["shutdown_result"] = {
+            "ok": False,
+            "error": str(exc),
+            "script": str(script),
+            "wittypi_dir": str(wittypi_dir),
+        }
+        append_log(log_file, f"POWER ERROR: terminal shutdown exec failed before GPIO-4 trigger: {exc}")
+        return False
 
 def record(config: Dict[str, Any], config_source: Optional[str], config_source_type: str, external_storage_used: bool, config_warnings: List[str]) -> int:
     validate_config(config)
@@ -2730,26 +2820,36 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
         except Exception as status_exc:
             append_log(log_file, f"WARNING: failed to write status files: {status_exc}")
 
-        # Power control is done only after media, metadata and status are safely written.
+        # Power control phase 1: schedule startup only. GPIO-4 is deliberately
+        # NOT touched here because Poracam still needs to persist final state.
+        power_info: Dict[str, Any]
         try:
-            power_info = perform_power_control(config, status, start_epoch, log_file)
-            metadata["power"] = power_info
-            write_metadata_file(metadata_file, metadata, log_file)
-            try:
-                write_status_files(status_dir, metadata, status, error_message)
-            except Exception as status_exc:
-                append_log(log_file, f"WARNING: failed to rewrite status files after power control: {status_exc}")
-            sync_filesystem(log_file)
+            power_info = prepare_power_control(config, status, start_epoch, log_file)
         except Exception as power_exc:
-            append_log(log_file, f"POWER ERROR: unexpected failure: {power_exc}")
-            metadata["power"] = {"enabled": bool(config.get("power_control_enabled", False)), "error": str(power_exc)}
-            write_metadata_file(metadata_file, metadata, log_file)
+            append_log(log_file, f"POWER ERROR: unexpected scheduling failure: {power_exc}")
+            power_info = {
+                "enabled": bool(config.get("power_control_enabled", False)),
+                "shutdown_pending": False,
+                "shutdown_requested": False,
+                "shutdown_skipped_reason": "power_prepare_exception",
+                "error": str(power_exc),
+            }
+
+        metadata["power"] = power_info
+
+        # Persist power schedule/result BEFORE any real shutdown request.
+        write_metadata_file(metadata_file, metadata, log_file)
+        try:
+            write_status_files(status_dir, metadata, status, error_message)
+        except Exception as status_exc:
+            append_log(log_file, f"WARNING: failed to rewrite status files after power scheduling: {status_exc}")
 
         if status == "ok":
             led_solid_on()
         elif field_check_failure:
             led_error_blink()
 
+        # These are the final Poracam disk writes for a real power-controlled cycle.
         append_log(log_file, f"Metadata saved: {metadata_file if METADATA_ENABLED else 'disabled'}")
         append_log(log_file, f"Final status: {status}")
         append_log(log_file, f"Total elapsed: {timing['total_s']} s")
@@ -2764,10 +2864,18 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
             free_mb=(storage_after or storage_before or {}).get("free_mb") if (storage_after or storage_before) else None,
             next_startup=(metadata.get("power") or {}).get("next_startup_time"),
         )
-        try:
-            sync_filesystem(log_file)
-        except Exception as sync_exc:
-            append_log(log_file, f"WARNING: final sync failed: {sync_exc}")
+
+        if bool(power_info.get("shutdown_pending", False)):
+            # TERMINAL ACTION: on success this replaces the Python process and
+            # never returns. Nothing in Poracam executes after the GPIO-4 trigger.
+            execute_terminal_shutdown(config, power_info, log_file)
+        else:
+            # No shutdown will occur (disabled, field-check failure, schedule
+            # failure, etc.), so a conventional logged sync is safe here.
+            try:
+                sync_filesystem(log_file)
+            except Exception as sync_exc:
+                append_log(log_file, f"WARNING: final sync failed: {sync_exc}")
     return 0 if status == "ok" else 1
 
 
