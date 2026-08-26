@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-poracam_record.py — Poracam v0.8.3.3
+poracam_record.py — Poracam v0.8.3.4
 
-Novidades da v0.8.3.3:
-- Aumenta a janela máxima de descoberta/montagem do pendrive de 30 s para 90 s.
-- Prefere captura ALSA direta em hw:<card>,<device>, detectada dinamicamente por `arecord -l`.
-- Mantém plughw/default somente como fallback e usa buffer de captura de 2 s.
-- Corrige o status para mostrar metadata como desabilitada quando METADATA_ENABLED=False.
-- Preserva a correção validada de shutdown terminal: nenhuma escrita do PORACAM após o GPIO-4.
+Novidades da v0.8.3.4:
+- Adiciona recuperação automática para falha transitória de enumeração/montagem do pendrive.
+- Após uma falha inicial, agenda até 3 novos power-cycles de recuperação, espaçados em 3 min.
+- Zera automaticamente o contador de recuperação assim que o armazenamento externo reaparece.
+- Mantém bloqueado o fallback de gravação no cartão SD.
+- Evita cair para plughw quando hw está apenas temporariamente ocupado; prioriza novo retry de hw.
+- Preserva timeout USB de 90 s, áudio hw direto com buffer de 2 s e shutdown terminal validado.
 """
 
 import argparse
@@ -26,7 +27,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 PROJECT_NAME = "poracam"
-PROJECT_VERSION = "0.8.3.3"
+PROJECT_VERSION = "0.8.3.4"
 
 # ============================================================
 # Developer/internal configuration
@@ -44,7 +45,7 @@ MAX_STORAGE_PERCENT = 95.0
 MIN_FREE_MB_BEFORE_RECORDING = 300
 STOP_SCHEDULING_WHEN_STORAGE_FULL = True
 
-# v0.8.3.3: production-oriented diagnostics.
+# v0.8.3.4: production-oriented diagnostics.
 # Full metadata remains enabled by default while the system is still being validated.
 METADATA_ENABLED = False
 LIGHT_LOG_ENABLED = True
@@ -52,14 +53,14 @@ TRASH_DETECTION_ENABLED = True
 TRASH_WARNING_MIN_MB = 50
 TRASH_DIR_NAMES = (".Trash", ".Trash-1000", ".Trashes", "$RECYCLE.BIN", "RECYCLER", "System Volume Information")
 
-# v0.8.3.3: optional time/date adjustment through a one-shot file on the USB drive.
+# v0.8.3.4: optional time/date adjustment through a one-shot file on the USB drive.
 # File must be placed beside PORACAM/config.txt.
 TIME_SET_ENABLED = True
 TIME_SET_FILE_NAMES = ("SET_TIME.txt", "set_time.txt", "datetime.txt", "data_hora.txt")
 TIME_SET_DONE_FILE_NAME = "time_set_last_ok.txt"
 TIME_SET_ERROR_SUFFIX = ".error"
 
-# v0.8.3.3: initial campaign check and LED status.
+# v0.8.3.4: initial campaign check and LED status.
 FIELD_CHECK_ENABLED = True
 FIELD_CHECK_DURATION_S = 30
 READY_STATUS_FILE_NAME = "PRONTO_PARA_CAMPO.txt"
@@ -70,22 +71,30 @@ LED_OFF_BRIGHTNESS = "0"
 LED_CHECK_DELAY_MS = 1000
 LED_ERROR_DELAY_MS = 120
 
-# v0.8.3.3: allow slow/re-enumerating USB storage enough time to become available.
+# v0.8.3.4: allow slow/re-enumerating USB storage enough time to become available.
 # The loop exits immediately when PORACAM/config.txt is found, so 90 s is only the maximum recovery window.
 EXTERNAL_CONFIG_WAIT_TIMEOUT_S = 90
 EXTERNAL_CONFIG_RETRY_INTERVAL_S = 2
 EXTERNAL_CONFIG_UDEV_SETTLE_TIMEOUT_S = 4
 EXTERNAL_CONFIG_TRY_MANUAL_MOUNT = True
 
-# v0.8.3.3: if external storage was selected, verify it is still mounted before recording
+# v0.8.3.4: if external storage was selected, verify it is still mounted before recording
 # and before writing metadata/status. This avoids writing to a stale /media directory
 # if the USB storage resets/disappears mid-cycle.
 EXTERNAL_STORAGE_VERIFY_BEFORE_RECORDING = True
 EXTERNAL_STORAGE_VERIFY_BEFORE_METADATA = True
 
-# v0.8.3.3: in autonomous/Witty Pi mode, never silently record to local SD
+# v0.8.3.4: in autonomous/Witty Pi mode, never silently record to local SD
 # when the PORACAM pendrive is missing. This prevents losing field data on the Pi.
 REQUIRE_EXTERNAL_STORAGE_IN_POWER_CONTROL = True
+
+# v0.8.3.4: tolerate transient USB enumeration failures without turning one bad boot
+# into the end of an autonomous campaign. The first failed boot may schedule retry #1;
+# up to 3 recovery boots are allowed. A successful external-storage boot resets the state.
+EXTERNAL_STORAGE_RECOVERY_ENABLED = True
+EXTERNAL_STORAGE_RECOVERY_MAX_RETRIES = 3
+EXTERNAL_STORAGE_RECOVERY_RETRY_DELAY_S = 180
+EXTERNAL_STORAGE_RECOVERY_STATE_FILE = "/home/fishcam/poracam/status/external_storage_retry.json"
 
 EXTERNAL_MOUNT_BASE_DIRS = [
     "/media/fishcam",
@@ -99,7 +108,7 @@ AUDIO_RATE_HZ = 44100
 AUDIO_CHANNELS = 1
 AUDIO_BUFFER_TIME_US = 2000000  # 2 s; validated with hw: capture + 1080p20 raspivid
 
-# v0.8.3.3: prefer the direct ALSA hardware PCM discovered by `arecord -l`.
+# v0.8.3.4: prefer the direct ALSA hardware PCM discovered by `arecord -l`.
 # The validated USB interface accepts S16_LE / 44.1 kHz / mono directly on hw:<card>,<device>.
 # plughw is kept only as a fallback because it produced capture overruns during camera recording.
 AUDIO_PROBE_SECONDS = 1
@@ -618,6 +627,100 @@ def save_recovery_metadata(metadata: Dict[str, Any], reason: str) -> Optional[st
         return None
 
 
+def external_storage_recovery_state_path() -> Path:
+    return Path(EXTERNAL_STORAGE_RECOVERY_STATE_FILE)
+
+
+def load_external_storage_recovery_state() -> Dict[str, Any]:
+    path = external_storage_recovery_state_path()
+    default = {
+        "consecutive_failures": 0,
+        "retries_scheduled": 0,
+        "last_failure_time": None,
+        "last_success_time": None,
+        "state_file": str(path),
+    }
+    try:
+        if not path.exists():
+            return default
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return default
+        state = dict(default)
+        state.update(raw)
+        state["consecutive_failures"] = max(0, int(state.get("consecutive_failures", 0)))
+        state["retries_scheduled"] = max(0, int(state.get("retries_scheduled", 0)))
+        return state
+    except Exception:
+        return default
+
+
+def write_external_storage_recovery_state(state: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+    path = external_storage_recovery_state_path()
+    try:
+        ensure_dir(path.parent)
+        payload = dict(state)
+        payload["state_file"] = str(path)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        os.replace(str(tmp), str(path))
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
+
+
+def register_external_storage_recovery_failure(warnings: List[str]) -> Dict[str, Any]:
+    state = load_external_storage_recovery_state()
+    state["consecutive_failures"] = int(state.get("consecutive_failures", 0)) + 1
+    state["last_failure_time"] = iso_now()
+    ok, err = write_external_storage_recovery_state(state)
+    state["persisted"] = ok
+    state["persist_error"] = err
+    if not ok:
+        warnings.append(f"não foi possível persistir contador de recuperação USB: {err}")
+    return state
+
+
+def mark_external_storage_recovery_retry_scheduled(warnings: List[str]) -> Dict[str, Any]:
+    state = load_external_storage_recovery_state()
+    state["retries_scheduled"] = int(state.get("retries_scheduled", 0)) + 1
+    ok, err = write_external_storage_recovery_state(state)
+    state["persisted"] = ok
+    state["persist_error"] = err
+    if not ok:
+        warnings.append(f"não foi possível persistir retry de recuperação USB: {err}")
+    return state
+
+
+def reset_external_storage_recovery_state(warnings: List[str]) -> None:
+    path = external_storage_recovery_state_path()
+    if not path.exists():
+        return
+    previous = load_external_storage_recovery_state()
+    failures = int(previous.get("consecutive_failures", 0))
+    retries = int(previous.get("retries_scheduled", 0))
+    try:
+        path.unlink()
+        warnings.append(
+            f"armazenamento externo recuperado; contador USB zerado "
+            f"(falhas consecutivas anteriores={failures}, retries agendados={retries})."
+        )
+    except Exception as exc:
+        # Best effort fallback: write an explicit zero state if unlink is not possible.
+        zero = {
+            "consecutive_failures": 0,
+            "retries_scheduled": 0,
+            "last_failure_time": previous.get("last_failure_time"),
+            "last_success_time": iso_now(),
+            "state_file": str(path),
+        }
+        ok, err = write_external_storage_recovery_state(zero)
+        if ok:
+            warnings.append(f"armazenamento externo recuperado; contador USB zerado por sobrescrita ({exc}).")
+        else:
+            warnings.append(f"falha ao zerar contador de recuperação USB: unlink={exc}; write={err}")
+
+
 def find_local_config_path() -> Optional[Path]:
     candidates = [
         Path.cwd() / "config.txt",
@@ -1058,7 +1161,7 @@ def handle_time_set_command(config: Dict[str, Any], config_source: Optional[str]
     """
     Process a one-shot USB time set file, if present.
 
-    In v0.8.3.3, SET_TIME.txt also marks the beginning of a new campaign:
+    In v0.8.3.4, SET_TIME.txt also marks the beginning of a new campaign:
       - set system time;
       - write system time to Witty Pi RTC;
       - request a short field check recording;
@@ -1179,19 +1282,60 @@ def merge_config(args: argparse.Namespace) -> Tuple[Dict[str, Any], Optional[str
     if args.wittypi_dir:
         final_config["wittypi_dir"] = args.wittypi_dir
 
-    if (
+    power_control_requires_external = (
         bool(final_config.get("power_control_enabled", False))
         and bool(final_config.get("require_external_storage_in_power_control", REQUIRE_EXTERNAL_STORAGE_IN_POWER_CONTROL))
-        and not external_used
         and not args.ignore_external_storage
-    ):
+    )
+
+    if power_control_requires_external and external_used:
+        # Any successful external-storage boot ends the transient recovery streak.
+        reset_external_storage_recovery_state(warnings)
+
+    if power_control_requires_external and not external_used:
         final_config["_poracam_external_required_missing"] = True
-        final_config["_poracam_stop_scheduling"] = True
-        final_config["_poracam_stop_scheduling_reason"] = "external_storage_missing"
         warnings.append(
             "modo power-control requer armazenamento externo; "
             "fallback local foi bloqueado para evitar gravar dados no cartão SD."
         )
+
+        if EXTERNAL_STORAGE_RECOVERY_ENABLED:
+            recovery = register_external_storage_recovery_failure(warnings)
+            failures = int(recovery.get("consecutive_failures", 0))
+            persisted = bool(recovery.get("persisted", False))
+            final_config["_poracam_storage_recovery_state"] = recovery
+
+            # failure #1 schedules recovery retry #1; failures 2 and 3 schedule retries #2/#3.
+            # failure #4 means the initial failure + all three recovery boots have failed.
+            if persisted and failures <= EXTERNAL_STORAGE_RECOVERY_MAX_RETRIES:
+                final_config["_poracam_storage_recovery_pending"] = True
+                final_config["_poracam_storage_recovery_retry_number"] = failures
+                final_config["_poracam_storage_recovery_delay_s"] = EXTERNAL_STORAGE_RECOVERY_RETRY_DELAY_S
+                final_config["_poracam_stop_scheduling"] = False
+                final_config["_poracam_stop_scheduling_reason"] = ""
+                warnings.append(
+                    "armazenamento externo ausente; recuperação automática armada: "
+                    f"retry {failures}/{EXTERNAL_STORAGE_RECOVERY_MAX_RETRIES} em "
+                    f"{EXTERNAL_STORAGE_RECOVERY_RETRY_DELAY_S}s."
+                )
+            else:
+                final_config["_poracam_storage_recovery_pending"] = False
+                final_config["_poracam_stop_scheduling"] = True
+                if persisted:
+                    final_config["_poracam_stop_scheduling_reason"] = "external_storage_recovery_exhausted"
+                    warnings.append(
+                        "armazenamento externo permaneceu ausente após a falha inicial e "
+                        f"{EXTERNAL_STORAGE_RECOVERY_MAX_RETRIES} retries; novos startups serão interrompidos."
+                    )
+                else:
+                    final_config["_poracam_stop_scheduling_reason"] = "external_storage_recovery_state_unavailable"
+                    warnings.append(
+                        "contador de recuperação USB não pôde ser persistido; por segurança, "
+                        "novos startups serão interrompidos para evitar retry infinito."
+                    )
+        else:
+            final_config["_poracam_stop_scheduling"] = True
+            final_config["_poracam_stop_scheduling_reason"] = "external_storage_missing"
 
     return final_config, config_source, source_type, external_used, warnings
 
@@ -1280,11 +1424,21 @@ def probe_audio_device(device: str, log_file: Path) -> Tuple[bool, str]:
     return False, msg
 
 
+def audio_error_is_busy(message: str) -> bool:
+    text = str(message or "").lower()
+    return (
+        "device or resource busy" in text
+        or "dispositivo ou recurso está ocupado" in text
+        or "dispositivo ou recurso esta ocupado" in text
+        or "resource busy" in text
+    )
+
+
 def resolve_audio_device(config: Dict[str, Any], log_file: Path) -> Dict[str, Any]:
     """
     Resolve the audio capture device with retry.
 
-    v0.8.3.3 rationale:
+    v0.8.3.4 rationale:
     after Witty Pi powers the Raspberry, the USB audio interface may not be immediately
     enumerated by ALSA. Prefer direct hw:<card>,<device> access because simultaneous
     camera/audio tests showed overruns with plughw while hw remained stable. Keep retry
@@ -1366,7 +1520,18 @@ def resolve_audio_device(config: Dict[str, Any], log_file: Path) -> Dict[str, An
         attempt_info["candidates"] = unique_candidates
         result["candidates"] = unique_candidates
 
+        busy_direct_addresses = set()
         for dev in unique_candidates:
+            if dev.startswith("plughw:"):
+                address = dev.split(":", 1)[1]
+                if address in busy_direct_addresses:
+                    append_log(
+                        log_file,
+                        f"Audio probe skipped: {dev}; matching hw:{address} was temporarily busy, "
+                        "so direct hardware will be retried instead of falling back to ALSA plug.",
+                    )
+                    continue
+
             ok, msg = probe_audio_device(dev, log_file)
             probe_item = {"device": dev, "ok": ok, "message": msg[-500:]}
             attempt_info["probe"].append(probe_item)
@@ -1382,6 +1547,10 @@ def resolve_audio_device(config: Dict[str, Any], log_file: Path) -> Dict[str, An
                 append_log(log_file, f"Audio transport: {transport}")
                 append_log(log_file, f"Audio buffer requested: {AUDIO_BUFFER_TIME_US} us")
                 return result
+
+            if dev.startswith("hw:") and audio_error_is_busy(msg):
+                busy_direct_addresses.add(dev.split(":", 1)[1])
+                append_log(log_file, f"Audio direct hardware temporarily busy: {dev}; preserving hw preference for next retry.")
             last_error = msg
 
         result["attempts"].append(attempt_info)
@@ -1762,7 +1931,7 @@ def validate_config(config: Dict[str, Any]) -> None:
     if int(config["cycle_period_s"]) < int(config["duration"]):
         raise ValueError(f"cycle_period_s precisa ser maior ou igual a record_duration_s/duration. Recebido: cycle_period_s={config['cycle_period_s']}, duration={config['duration']}")
     if str(config["run_mode"]).lower() != "single":
-        raise ValueError(f"Na v0.8.3.3, apenas run_mode=single é suportado. Recebido: run_mode={config['run_mode']}")
+        raise ValueError(f"Na v0.8.3.4, apenas run_mode=single é suportado. Recebido: run_mode={config['run_mode']}")
     for key in ("width", "height", "fps", "bitrate"):
         if int(config[key]) <= 0:
             raise ValueError(f"{key} precisa ser maior que zero.")
@@ -2190,8 +2359,10 @@ def prepare_power_control(
     has finished. The actual GPIO-4 shutdown trigger is performed later by
     execute_terminal_shutdown(), which is the terminal action of the process.
 
-    The next startup is based on recording_start_epoch + cycle_period_s, not on
-    end-of-processing time.
+    For normal successful cycles, the next startup is based on
+    recording_start_epoch + cycle_period_s, not on end-of-processing time.
+    For external-storage recovery boots, the target is based on now + the
+    dedicated recovery retry delay because no recording occurred.
     """
     enabled = bool(config.get("power_control_enabled", False))
     dry_run = bool(config.get("power_dry_run", False))
@@ -2202,12 +2373,21 @@ def prepare_power_control(
     require_schedule = bool(config.get("require_startup_schedule_before_shutdown", True))
 
     now_epoch = int(time.time())
-    target_epoch = compute_next_cycle_start_epoch(
-        start_epoch=recording_start_epoch,
-        cycle_period_s=cycle_period_s,
-        minimum_off_time_s=minimum_off_time_s,
-        now_epoch=now_epoch,
-    )
+    recovery_pending = bool(config.get("_poracam_storage_recovery_pending", False))
+    recovery_retry_number = int(config.get("_poracam_storage_recovery_retry_number", 0) or 0)
+    recovery_delay_s = int(config.get("_poracam_storage_recovery_delay_s", EXTERNAL_STORAGE_RECOVERY_RETRY_DELAY_S))
+
+    if recovery_pending:
+        # Missing-storage recovery is based on now, because no recording took place in this boot.
+        # Ensure the target still leaves the configured minimum off-time after shutdown.
+        target_epoch = max(now_epoch + recovery_delay_s, now_epoch + minimum_off_time_s)
+    else:
+        target_epoch = compute_next_cycle_start_epoch(
+            start_epoch=recording_start_epoch,
+            cycle_period_s=cycle_period_s,
+            minimum_off_time_s=minimum_off_time_s,
+            now_epoch=now_epoch,
+        )
 
     wittypi_dir = find_wittypi_dir(config)
 
@@ -2232,6 +2412,10 @@ def prepare_power_control(
         "shutdown_pending": False,
         "shutdown_request_mode": "terminal_exec",
         "shutdown_skipped_reason": None,
+        "external_storage_recovery_pending": recovery_pending,
+        "external_storage_recovery_retry_number": recovery_retry_number if recovery_pending else None,
+        "external_storage_recovery_max_retries": EXTERNAL_STORAGE_RECOVERY_MAX_RETRIES,
+        "external_storage_recovery_delay_s": recovery_delay_s if recovery_pending else None,
     }
 
     if not enabled:
@@ -2263,6 +2447,17 @@ def prepare_power_control(
             log_file=log_file,
         )
         power["schedule_result"] = schedule_result
+        if recovery_pending and schedule_result.get("ok"):
+            recovery_warnings: List[str] = []
+            recovery_state = mark_external_storage_recovery_retry_scheduled(recovery_warnings)
+            power["external_storage_recovery_state"] = recovery_state
+            append_log(
+                log_file,
+                f"POWER: external-storage recovery retry {recovery_retry_number}/"
+                f"{EXTERNAL_STORAGE_RECOVERY_MAX_RETRIES} scheduled for {power['next_startup_time']}.",
+            )
+            for recovery_warning in recovery_warnings:
+                append_log(log_file, f"POWER WARNING: {recovery_warning}")
 
     if not shutdown_after_recording:
         power["shutdown_skipped_reason"] = "shutdown_after_recording_false"
@@ -2489,6 +2684,10 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
             "external_config_wait_timeout_s": EXTERNAL_CONFIG_WAIT_TIMEOUT_S,
             "external_config_retry_interval_s": EXTERNAL_CONFIG_RETRY_INTERVAL_S,
             "external_config_try_manual_mount": EXTERNAL_CONFIG_TRY_MANUAL_MOUNT,
+            "external_storage_recovery_enabled": EXTERNAL_STORAGE_RECOVERY_ENABLED,
+            "external_storage_recovery_max_retries": EXTERNAL_STORAGE_RECOVERY_MAX_RETRIES,
+            "external_storage_recovery_retry_delay_s": EXTERNAL_STORAGE_RECOVERY_RETRY_DELAY_S,
+            "external_storage_recovery_state_file": EXTERNAL_STORAGE_RECOVERY_STATE_FILE,
             "external_storage_verify_before_recording": EXTERNAL_STORAGE_VERIFY_BEFORE_RECORDING,
             "external_storage_verify_before_metadata": EXTERNAL_STORAGE_VERIFY_BEFORE_METADATA,
             "power_control_enabled": bool(config.get("power_control_enabled", False)),
@@ -2502,6 +2701,7 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
         "audio": audio_resolution,
         "camera": {"conflicts": None, "audio_started": False},
         "storage": {"before": None, "after": None},
+        "external_storage_recovery": config.get("_poracam_storage_recovery_state"),
         "segments": [],
         "timing": timing,
         "files": {},
@@ -2755,9 +2955,19 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
     except ExternalStorageRequiredError as exc:
         status = "error"
         error_message = str(exc)
-        stop_scheduling_reason = "external_storage_missing"
-        config["_poracam_stop_scheduling"] = True
-        config["_poracam_stop_scheduling_reason"] = stop_scheduling_reason
+        recovery_pending = bool(config.get("_poracam_storage_recovery_pending", False))
+        if recovery_pending:
+            stop_scheduling_reason = None
+            config["_poracam_stop_scheduling"] = False
+            config["_poracam_stop_scheduling_reason"] = ""
+        else:
+            stop_scheduling_reason = str(
+                config.get("_poracam_stop_scheduling_reason", "external_storage_missing")
+                or "external_storage_missing"
+            )
+            config["_poracam_stop_scheduling"] = True
+            config["_poracam_stop_scheduling_reason"] = stop_scheduling_reason
+
         if field_check_requested:
             field_check_failure = True
             config["shutdown_after_recording"] = False
@@ -2775,7 +2985,19 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
             except Exception as ready_exc:
                 append_log(log_file, f"WARNING: failed to write ready failure status: {ready_exc}")
         append_log(log_file, f"ERROR: {error_message}")
-        append_log(log_file, "POWER: external storage missing; next startup will not be scheduled.")
+        if recovery_pending:
+            append_log(
+                log_file,
+                "POWER: external storage missing; automatic recovery power-cycle will be scheduled "
+                f"(retry {config.get('_poracam_storage_recovery_retry_number')}/"
+                f"{EXTERNAL_STORAGE_RECOVERY_MAX_RETRIES}).",
+            )
+        else:
+            append_log(
+                log_file,
+                f"POWER: external storage missing; recovery stopped ({stop_scheduling_reason}); "
+                "next startup will not be scheduled.",
+            )
 
     except Exception as exc:
         status = "error"
@@ -2924,7 +3146,7 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Poracam v0.8.3.3: USB boot robustness, direct ALSA hardware capture and terminal Witty Pi shutdown."
+        description="Poracam v0.8.3.4: USB boot robustness, direct ALSA hardware capture and terminal Witty Pi shutdown."
     )
 
     parser.add_argument(
@@ -2946,7 +3168,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     # Developer/installation flags. Not intended for the end-user config.txt.
     parser.add_argument("--power-control", action="store_true", help="Ativa agendamento Witty Pi + shutdown ao final da gravação.")
-    parser.add_argument("--no-power-control", action="store_true", help="Desativa controle de energia, mesmo na v0.8.3.3.")
+    parser.add_argument("--no-power-control", action="store_true", help="Desativa controle de energia, mesmo na v0.8.3.4.")
     parser.add_argument("--power-dry-run", action="store_true", help="Simula agendamento/shutdown sem escrever no Witty Pi nem desligar.")
     parser.add_argument("--wittypi-dir", default=None, help="Diretório do Witty Pi contendo utilities.sh.")
 

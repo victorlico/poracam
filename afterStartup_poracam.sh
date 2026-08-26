@@ -11,11 +11,10 @@ PORACAM_DIR="/home/fishcam/poracam"
 PORACAM_SCRIPT="$PORACAM_DIR/poracam_record.py"
 LOG="$PORACAM_DIR/poracam_afterStartup.log"
 mkdir -p "$PORACAM_DIR"
-echo "$(date '+%F %T') [afterStartup] launching Poracam v0.8.3.3" >> "$LOG"
+echo "$(date '+%F %T') [afterStartup] launching Poracam v0.8.3.4" >> "$LOG"
 if [ ! -x "$PORACAM_SCRIPT" ]; then
   echo "$(date '+%F %T') [afterStartup] ERROR: Poracam script not executable: $PORACAM_SCRIPT" >> "$LOG"
   exit 1
 fi
 /usr/bin/python3 "$PORACAM_SCRIPT" --power-control >> "$LOG" 2>&1 &
 echo "$(date '+%F %T') [afterStartup] Poracam started in background with PID $!" >> "$LOG"
-exit 0
