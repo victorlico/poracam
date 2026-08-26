@@ -1,7 +1,7 @@
 #!/bin/bash
 # file: poracam_wittypi_power.sh
 #
-# Poracam v0.8.3.2 - Witty Pi integration with terminal shutdown trigger.
+# Poracam v0.8.3.3 - Witty Pi integration with terminal shutdown trigger.
 #
 # Actions:
 #   schedule-startup --target-epoch <epoch>

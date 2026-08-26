@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-poracam_record.py — Poracam v0.8.3.2
+poracam_record.py — Poracam v0.8.3.3
 
-Novidades da v0.8.3.2:
-- Aguarda e tenta montar armazenamento externo USB antes de cair para armazenamento local.
-- Procura armazenamento externo com PORACAM/config.txt em /media/*/* e /mnt/*.
-- Se encontrar config externo, usa esse config e salva em PORACAM/media quando media_dir não estiver definido.
-- Mantém fallback local.
-- Cria arquivos de status em PORACAM/status ou no diretório pai de media/.
-- Mantém a lógica validada: vídeo MP4 final, áudio WAV separado, H264 temporário apagado.
+Novidades da v0.8.3.3:
+- Aumenta a janela máxima de descoberta/montagem do pendrive de 30 s para 90 s.
+- Prefere captura ALSA direta em hw:<card>,<device>, detectada dinamicamente por `arecord -l`.
+- Mantém plughw/default somente como fallback e usa buffer de captura de 2 s.
+- Corrige o status para mostrar metadata como desabilitada quando METADATA_ENABLED=False.
+- Preserva a correção validada de shutdown terminal: nenhuma escrita do PORACAM após o GPIO-4.
 """
 
 import argparse
@@ -27,7 +26,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 PROJECT_NAME = "poracam"
-PROJECT_VERSION = "0.8.3.2"
+PROJECT_VERSION = "0.8.3.3"
 
 # ============================================================
 # Developer/internal configuration
@@ -45,7 +44,7 @@ MAX_STORAGE_PERCENT = 95.0
 MIN_FREE_MB_BEFORE_RECORDING = 300
 STOP_SCHEDULING_WHEN_STORAGE_FULL = True
 
-# v0.8.3.2: production-oriented diagnostics.
+# v0.8.3.3: production-oriented diagnostics.
 # Full metadata remains enabled by default while the system is still being validated.
 METADATA_ENABLED = False
 LIGHT_LOG_ENABLED = True
@@ -53,14 +52,14 @@ TRASH_DETECTION_ENABLED = True
 TRASH_WARNING_MIN_MB = 50
 TRASH_DIR_NAMES = (".Trash", ".Trash-1000", ".Trashes", "$RECYCLE.BIN", "RECYCLER", "System Volume Information")
 
-# v0.8.3.2: optional time/date adjustment through a one-shot file on the USB drive.
+# v0.8.3.3: optional time/date adjustment through a one-shot file on the USB drive.
 # File must be placed beside PORACAM/config.txt.
 TIME_SET_ENABLED = True
 TIME_SET_FILE_NAMES = ("SET_TIME.txt", "set_time.txt", "datetime.txt", "data_hora.txt")
 TIME_SET_DONE_FILE_NAME = "time_set_last_ok.txt"
 TIME_SET_ERROR_SUFFIX = ".error"
 
-# v0.8.3.2: initial campaign check and LED status.
+# v0.8.3.3: initial campaign check and LED status.
 FIELD_CHECK_ENABLED = True
 FIELD_CHECK_DURATION_S = 30
 READY_STATUS_FILE_NAME = "PRONTO_PARA_CAMPO.txt"
@@ -71,20 +70,20 @@ LED_OFF_BRIGHTNESS = "0"
 LED_CHECK_DELAY_MS = 1000
 LED_ERROR_DELAY_MS = 120
 
-# v0.8.3.2: wait briefly for USB storage at boot before falling back to local storage.
-# Balanced for short cycles: enough for USB enumeration, not so long that 1 min / 3 min cycles become too tight.
-EXTERNAL_CONFIG_WAIT_TIMEOUT_S = 30
+# v0.8.3.3: allow slow/re-enumerating USB storage enough time to become available.
+# The loop exits immediately when PORACAM/config.txt is found, so 90 s is only the maximum recovery window.
+EXTERNAL_CONFIG_WAIT_TIMEOUT_S = 90
 EXTERNAL_CONFIG_RETRY_INTERVAL_S = 2
 EXTERNAL_CONFIG_UDEV_SETTLE_TIMEOUT_S = 4
 EXTERNAL_CONFIG_TRY_MANUAL_MOUNT = True
 
-# v0.8.3.2: if external storage was selected, verify it is still mounted before recording
+# v0.8.3.3: if external storage was selected, verify it is still mounted before recording
 # and before writing metadata/status. This avoids writing to a stale /media directory
 # if the USB storage resets/disappears mid-cycle.
 EXTERNAL_STORAGE_VERIFY_BEFORE_RECORDING = True
 EXTERNAL_STORAGE_VERIFY_BEFORE_METADATA = True
 
-# v0.8.3.2: in autonomous/Witty Pi mode, never silently record to local SD
+# v0.8.3.3: in autonomous/Witty Pi mode, never silently record to local SD
 # when the PORACAM pendrive is missing. This prevents losing field data on the Pi.
 REQUIRE_EXTERNAL_STORAGE_IN_POWER_CONTROL = True
 
@@ -98,10 +97,11 @@ AUDIO_DEVICE = "auto"
 AUDIO_FORMAT = "S16_LE"
 AUDIO_RATE_HZ = 44100
 AUDIO_CHANNELS = 1
+AUDIO_BUFFER_TIME_US = 2000000  # 2 s; validated with hw: capture + 1080p20 raspivid
 
-# v0.8.3.2: Witty Pi usually starts Poracam as root/system.
-# In that context ALSA PCM "default" may not exist, even if it works in an interactive shell.
-# "auto" probes default and then falls back to the first physical capture device from `arecord -l`.
+# v0.8.3.3: prefer the direct ALSA hardware PCM discovered by `arecord -l`.
+# The validated USB interface accepts S16_LE / 44.1 kHz / mono directly on hw:<card>,<device>.
+# plughw is kept only as a fallback because it produced capture overruns during camera recording.
 AUDIO_PROBE_SECONDS = 1
 
 # USB audio devices can take a few seconds to appear after Witty Pi powers the Raspberry.
@@ -176,6 +176,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "bitrate": VIDEO_PROFILES["balanced"]["bitrate"],
     "audio_device": AUDIO_DEVICE,
     "audio_format": AUDIO_FORMAT,
+    "audio_buffer_time_us": AUDIO_BUFFER_TIME_US,
     "keep_h264": KEEP_H264,
     "start_delay": START_DELAY_S,
     "extra_timeout": EXTRA_TIMEOUT_S,
@@ -202,7 +203,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 }
 
 # User-facing keys accepted in config.txt.
-# Technical parameters are intentionally not accepted from config.txt in v0.8.3.2.
+# Technical parameters are intentionally not accepted from config.txt in v0.8.3.3.
 CONFIG_KEY_ALIASES = {
     "session_name": "session_name",
     "record_duration_min": "record_duration_min",
@@ -764,6 +765,7 @@ def apply_user_config_to_runtime(config: Dict[str, Any]) -> Dict[str, Any]:
     config["run_mode"] = "single"
     config["audio_device"] = AUDIO_DEVICE
     config["audio_format"] = AUDIO_FORMAT
+    config["audio_buffer_time_us"] = AUDIO_BUFFER_TIME_US
     config["keep_h264"] = KEEP_H264
     config["start_delay"] = START_DELAY_S
     config["extra_timeout"] = EXTRA_TIMEOUT_S
@@ -1056,7 +1058,7 @@ def handle_time_set_command(config: Dict[str, Any], config_source: Optional[str]
     """
     Process a one-shot USB time set file, if present.
 
-    In v0.8.3.2, SET_TIME.txt also marks the beginning of a new campaign:
+    In v0.8.3.3, SET_TIME.txt also marks the beginning of a new campaign:
       - set system time;
       - write system time to Witty Pi RTC;
       - request a short field check recording;
@@ -1212,16 +1214,28 @@ def run_quiet(command: List[str], timeout_s: int = 10) -> Tuple[int, str, str]:
         return 1, "", str(exc)
 
 
-def parse_arecord_capture_devices(output: str) -> List[str]:
-    devices: List[str] = []
+def parse_arecord_capture_devices(output: str) -> List[Tuple[int, int]]:
+    """Return unique physical ALSA capture addresses as (card, device)."""
+    devices: List[Tuple[int, int]] = []
     pattern = re.compile(r"card\s+(\d+):.*device\s+(\d+):", re.IGNORECASE)
     for line in output.splitlines():
         match = pattern.search(line)
         if match:
-            dev = f"plughw:{match.group(1)},{match.group(2)}"
-            if dev not in devices:
-                devices.append(dev)
+            addr = (int(match.group(1)), int(match.group(2)))
+            if addr not in devices:
+                devices.append(addr)
     return devices
+
+
+def audio_transport_for_device(device: str) -> str:
+    dev = str(device or "").strip().lower()
+    if dev.startswith("hw:"):
+        return "direct-hardware"
+    if dev.startswith("plughw:"):
+        return "alsa-plug-fallback"
+    if dev == "default":
+        return "alsa-default-fallback"
+    return "custom"
 
 
 def probe_audio_device(device: str, log_file: Path) -> Tuple[bool, str]:
@@ -1242,6 +1256,8 @@ def probe_audio_device(device: str, log_file: Path) -> Tuple[bool, str]:
         str(AUDIO_RATE_HZ),
         "-c",
         str(AUDIO_CHANNELS),
+        "--buffer-time",
+        str(AUDIO_BUFFER_TIME_US),
         "-d",
         str(AUDIO_PROBE_SECONDS),
         str(probe_path),
@@ -1268,10 +1284,11 @@ def resolve_audio_device(config: Dict[str, Any], log_file: Path) -> Dict[str, An
     """
     Resolve the audio capture device with retry.
 
-    v0.8.3.2 rationale:
+    v0.8.3.3 rationale:
     after Witty Pi powers the Raspberry, the USB audio interface may not be immediately
-    enumerated by ALSA. A single `arecord -l`/probe attempt can fail in the first seconds
-    of boot even though the device becomes available shortly after.
+    enumerated by ALSA. Prefer direct hw:<card>,<device> access because simultaneous
+    camera/audio tests showed overruns with plughw while hw remained stable. Keep retry
+    and plughw/default only as fallbacks.
     """
     requested = str(config.get("audio_device", AUDIO_DEVICE)).strip()
     auto_mode = requested.lower() in ("auto", "")
@@ -1279,7 +1296,9 @@ def resolve_audio_device(config: Dict[str, Any], log_file: Path) -> Dict[str, An
     result: Dict[str, Any] = {
         "requested": requested,
         "selected": None,
-        "method": "auto-retry" if auto_mode else "fixed-retry",
+        "method": "auto-hw-first-retry" if auto_mode else "fixed-retry",
+        "transport": None,
+        "buffer_time_us": AUDIO_BUFFER_TIME_US,
         "ready_timeout_s": AUDIO_READY_TIMEOUT_S,
         "retry_interval_s": AUDIO_READY_RETRY_INTERVAL_S,
         "arecord_l": None,
@@ -1305,7 +1324,7 @@ def resolve_audio_device(config: Dict[str, Any], log_file: Path) -> Dict[str, An
         if not auto_mode:
             candidates = [requested]
         else:
-            candidates: List[str] = ["default"]
+            candidates: List[str] = []
 
             rc, out, err = run_quiet(["/usr/bin/arecord", "-l"], timeout_s=10)
             arecord_l_text = (out + "\n" + err).strip()
@@ -1314,15 +1333,28 @@ def resolve_audio_device(config: Dict[str, Any], log_file: Path) -> Dict[str, An
 
             if rc == 0:
                 parsed = parse_arecord_capture_devices(out)
-                candidates.extend(parsed)
+                direct = [f"hw:{card},{device}" for card, device in parsed]
+                plug = [f"plughw:{card},{device}" for card, device in parsed]
+                candidates.extend(direct)
+                candidates.extend(plug)
                 if parsed:
-                    append_log(log_file, f"Audio attempt {attempt}: arecord -l found candidates: {parsed}")
+                    append_log(
+                        log_file,
+                        f"Audio attempt {attempt}: arecord -l found physical capture addresses: {parsed}; "
+                        f"direct candidates first: {direct}",
+                    )
                 else:
                     append_log(log_file, f"Audio attempt {attempt}: arecord -l returned no capture devices.")
             else:
                 append_log(log_file, f"Audio attempt {attempt}: arecord -l failed; rc={rc}; msg={arecord_l_text}")
 
-            candidates.extend(["plughw:1,0", "plughw:0,0"])
+            # Conservative fallbacks for images where arecord -l is temporarily incomplete.
+            # Direct hardware remains preferred; plug/default are only fallback paths.
+            candidates.extend([
+                "hw:1,0", "plughw:1,0",
+                "hw:0,0", "plughw:0,0",
+                "default",
+            ])
 
         unique_candidates: List[str] = []
         seen = set()
@@ -1340,10 +1372,15 @@ def resolve_audio_device(config: Dict[str, Any], log_file: Path) -> Dict[str, An
             attempt_info["probe"].append(probe_item)
             result["probe"].append(probe_item)
             if ok:
+                transport = audio_transport_for_device(dev)
                 result["selected"] = dev
+                result["transport"] = transport
                 result["attempts"].append(attempt_info)
                 config["audio_device"] = dev
+                config["_poracam_audio_transport"] = transport
                 append_log(log_file, f"Selected audio device after {attempt} attempt(s): {dev}")
+                append_log(log_file, f"Audio transport: {transport}")
+                append_log(log_file, f"Audio buffer requested: {AUDIO_BUFFER_TIME_US} us")
                 return result
             last_error = msg
 
@@ -1361,7 +1398,7 @@ def resolve_audio_device(config: Dict[str, Any], log_file: Path) -> Dict[str, An
         "Nenhum dispositivo de áudio funcionou após "
         f"{AUDIO_READY_TIMEOUT_S}s de espera. "
         "Rode `arecord -l` e teste manualmente "
-        "`arecord -D plughw:<card>,<device> -f cd -d 10 teste.wav`. "
+        "`arecord -D hw:<card>,<device> -f S16_LE -r 44100 -c 1 -d 10 teste.wav`. "
         f"Último erro: {last_error}"
     )
 
@@ -1725,7 +1762,7 @@ def validate_config(config: Dict[str, Any]) -> None:
     if int(config["cycle_period_s"]) < int(config["duration"]):
         raise ValueError(f"cycle_period_s precisa ser maior ou igual a record_duration_s/duration. Recebido: cycle_period_s={config['cycle_period_s']}, duration={config['duration']}")
     if str(config["run_mode"]).lower() != "single":
-        raise ValueError(f"Na v0.8.3.2, apenas run_mode=single é suportado. Recebido: run_mode={config['run_mode']}")
+        raise ValueError(f"Na v0.8.3.3, apenas run_mode=single é suportado. Recebido: run_mode={config['run_mode']}")
     for key in ("width", "height", "fps", "bitrate"):
         if int(config[key]) <= 0:
             raise ValueError(f"{key} precisa ser maior que zero.")
@@ -1756,6 +1793,8 @@ def write_status_files(status_dir: Path, metadata: Dict[str, Any], status: str, 
     last_run_file = status_dir / "last_run.json"
     last_error_file = status_dir / "last_error.txt"
     status_txt_file = status_dir / "poracam_status.txt"
+    metadata_enabled = bool(metadata.get("settings", {}).get("metadata_enabled", METADATA_ENABLED))
+    metadata_display = metadata.get("paths", {}).get("metadata") if metadata_enabled else "desabilitado"
     summary = {
         "project": metadata.get("project"),
         "version": metadata.get("version"),
@@ -1764,7 +1803,7 @@ def write_status_files(status_dir: Path, metadata: Dict[str, Any], status: str, 
         "last_end_time": metadata.get("end_time"),
         "video_mp4": metadata.get("paths", {}).get("video_mp4"),
         "audio_wav": metadata.get("paths", {}).get("audio_wav"),
-        "metadata": metadata.get("paths", {}).get("metadata") if metadata.get("settings", {}).get("metadata_enabled", True) else "desabilitado",
+        "metadata": metadata_display,
         "config_source": metadata.get("config_source"),
         "config_source_type": metadata.get("config_source_type"),
         "external_storage_used": metadata.get("external_storage_used"),
@@ -1782,7 +1821,7 @@ def write_status_files(status_dir: Path, metadata: Dict[str, Any], status: str, 
         f"Armazenamento externo: {metadata.get('external_storage_used')}",
         f"Video: {metadata.get('paths', {}).get('video_mp4')}",
         f"Audio: {metadata.get('paths', {}).get('audio_wav')}",
-        f"Metadata: {metadata.get('paths', {}).get('metadata') if metadata.get('settings', {}).get('metadata_enabled', True) else 'desabilitado'}",
+        f"Metadata: {metadata_display}",
     ]
     storage_before = metadata.get("storage", {}).get("before") or {}
     storage_after = metadata.get("storage", {}).get("after") or {}
@@ -1880,6 +1919,7 @@ def record_one_segment(
         "-f", str(config["audio_format"]),
         "-r", str(int(config.get("audio_rate_hz", AUDIO_RATE_HZ))),
         "-c", str(int(config.get("audio_channels", AUDIO_CHANNELS))),
+        "--buffer-time", str(int(config.get("audio_buffer_time_us", AUDIO_BUFFER_TIME_US))),
         "-d", str(int(segment_duration)),
         str(audio_wav),
     ]
@@ -2434,6 +2474,8 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
             "bitrate": int(config["bitrate"]),
             "audio_device": str(config["audio_device"]),
             "audio_format": str(config["audio_format"]),
+            "audio_buffer_time_us": int(config.get("audio_buffer_time_us", AUDIO_BUFFER_TIME_US)),
+            "metadata_enabled": bool(config.get("metadata_enabled", METADATA_ENABLED)),
             "keep_h264": bool(config["keep_h264"]),
             "delete_h264_after_mp4": not bool(config["keep_h264"]),
             "start_delay_s": float(config["start_delay"]),
@@ -2542,6 +2584,7 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
             raise
         metadata["audio"] = audio_resolution
         metadata["settings"]["audio_device"] = str(config["audio_device"])
+        metadata["settings"]["audio_transport"] = audio_resolution.get("transport")
         append_log(log_file, f"Audio device requested: {audio_resolution.get('requested')}")
         append_log(log_file, f"Audio device selected: {audio_resolution.get('selected')}")
 
@@ -2881,7 +2924,7 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Poracam v0.8.3.2: correção do erro de checklist antes da gravação curta."
+        description="Poracam v0.8.3.3: USB boot robustness, direct ALSA hardware capture and terminal Witty Pi shutdown."
     )
 
     parser.add_argument(
@@ -2903,7 +2946,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     # Developer/installation flags. Not intended for the end-user config.txt.
     parser.add_argument("--power-control", action="store_true", help="Ativa agendamento Witty Pi + shutdown ao final da gravação.")
-    parser.add_argument("--no-power-control", action="store_true", help="Desativa controle de energia, mesmo na v0.8.3.2.")
+    parser.add_argument("--no-power-control", action="store_true", help="Desativa controle de energia, mesmo na v0.8.3.3.")
     parser.add_argument("--power-dry-run", action="store_true", help="Simula agendamento/shutdown sem escrever no Witty Pi nem desligar.")
     parser.add_argument("--wittypi-dir", default=None, help="Diretório do Witty Pi contendo utilities.sh.")
 
