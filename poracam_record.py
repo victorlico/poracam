@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-poracam_record.py — Poracam v0.8.3.4
+poracam_record.py — Poracam v0.8.3.5
 
-Novidades da v0.8.3.4:
-- Adiciona recuperação automática para falha transitória de enumeração/montagem do pendrive.
-- Após uma falha inicial, agenda até 3 novos power-cycles de recuperação, espaçados em 3 min.
-- Zera automaticamente o contador de recuperação assim que o armazenamento externo reaparece.
-- Mantém bloqueado o fallback de gravação no cartão SD.
-- Evita cair para plughw quando hw está apenas temporariamente ocupado; prioriza novo retry de hw.
-- Preserva timeout USB de 90 s, áudio hw direto com buffer de 2 s e shutdown terminal validado.
+Novidades da v0.8.3.5:
+- Substitui o desligamento direto por GPIO-4 pelo Alarm 2 do MCU da Witty Pi.
+- Mantém o Alarm 1 para o próximo startup, sem exigir schedule.wpi.
+- O Alarm 2 só é armado depois que mídia, status e logs do PORACAM foram finalizados.
+- Usa margem de 20 s entre o armamento do Alarm 2 e o shutdown programado.
+- Não faz fallback automático para o antigo GPIO-4 se o Alarm 2 falhar, preservando um teste A/B limpo.
+- Preserva integralmente as melhorias da v0.8.3.4: recovery USB, áudio hw direto e bloqueio do fallback para SD.
 """
 
 import argparse
@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 PROJECT_NAME = "poracam"
-PROJECT_VERSION = "0.8.3.4"
+PROJECT_VERSION = "0.8.3.5"
 
 # ============================================================
 # Developer/internal configuration
@@ -136,7 +136,7 @@ WITTYPI_DIR_CANDIDATES = [
 ]
 WITTYPI_POWER_SCRIPT_NAME = "poracam_wittypi_power.sh"
 MINIMUM_OFF_TIME_S = 60
-SHUTDOWN_DELAY_S = 5
+SHUTDOWN_DELAY_S = 20
 REQUIRE_STARTUP_SCHEDULE_BEFORE_SHUTDOWN = True
 
 VIDEO_PROFILES: Dict[str, Dict[str, int]] = {
@@ -2353,11 +2353,12 @@ def prepare_power_control(
     log_file: Path,
 ) -> Dict[str, Any]:
     """
-    Schedule the next Witty Pi startup, but DO NOT request shutdown yet.
+    Schedule the next Witty Pi startup, but DO NOT arm shutdown yet.
 
     Shutdown is intentionally deferred until every Poracam file/status/log write
-    has finished. The actual GPIO-4 shutdown trigger is performed later by
-    execute_terminal_shutdown(), which is the terminal action of the process.
+    has finished. The Witty Pi Alarm 2 is armed later by
+    arm_wittypi_scheduled_shutdown(), reproducing the schedule.wpi shutdown path
+    without requiring a schedule file.
 
     For normal successful cycles, the next startup is based on
     recording_start_epoch + cycle_period_s, not on end-of-processing time.
@@ -2410,7 +2411,7 @@ def prepare_power_control(
         "shutdown_result": None,
         "shutdown_requested": False,
         "shutdown_pending": False,
-        "shutdown_request_mode": "terminal_exec",
+        "shutdown_request_mode": "wittypi_alarm2",
         "shutdown_skipped_reason": None,
         "external_storage_recovery_pending": recovery_pending,
         "external_storage_recovery_retry_number": recovery_retry_number if recovery_pending else None,
@@ -2468,8 +2469,8 @@ def prepare_power_control(
         append_log(log_file, "POWER: startup schedule failed; shutdown skipped to avoid losing recovery.")
         return power
 
-    # Important: only mark shutdown as pending here. No GPIO is touched yet.
-    # The trigger must happen after metadata/status/light-log/final sync.
+    # Important: only mark shutdown as pending here. Alarm 2 is NOT armed yet.
+    # It must be programmed only after metadata/status/light-log are finalized.
     power["shutdown_pending"] = True
     append_log(
         log_file,
@@ -2478,98 +2479,89 @@ def prepare_power_control(
     return power
 
 
-def execute_terminal_shutdown(
+def arm_wittypi_scheduled_shutdown(
     config: Dict[str, Any],
     power: Optional[Dict[str, Any]],
     log_file: Path,
 ) -> bool:
     """
-    Execute shutdown as the terminal Poracam action.
+    Arm Witty Pi Alarm 2 as the final Poracam power-control action.
 
-    For a real shutdown this function deliberately uses os.execv() to replace
-    the Python process with poracam_wittypi_power.sh. Therefore, after the
-    Witty Pi GPIO-4 trigger is issued successfully, no Python finally block,
-    metadata write, status write, LED update, log append or sync can run.
+    v0.8.3.5 deliberately does NOT pull GPIO-4 from the Raspberry Pi. Instead,
+    it programs the Witty Pi shutdown alarm (Alarm 2), which causes the Witty Pi
+    MCU to originate the shutdown event exactly as it does for schedule.wpi.
 
-    Returns only when no real shutdown is requested, in dry-run mode, or if the
-    terminal exec fails before the wrapper can be started.
+    The alarm is programmed only after media, metadata/status and the light log
+    are finalized. After successful arming, Poracam performs one final filesystem
+    sync and exits. The Witty Pi daemon remains waiting for GPIO-4; when Alarm 2
+    expires, the MCU pulls the shutdown line and daemon.sh follows the normal
+    REASON_ALARM2 -> beforeShutdown.sh -> do_shutdown() path.
+
+    No automatic fallback to the legacy Raspberry-driven GPIO-4 shutdown is used.
+    If Alarm 2 cannot be programmed, the system stays powered so the failure can
+    be diagnosed without reintroducing the old shutdown path.
     """
     if not power or not bool(power.get("shutdown_pending", False)):
         return False
 
     dry_run = bool(power.get("dry_run", False))
     shutdown_delay_s = int(power.get("shutdown_delay_s", config.get("shutdown_delay_s", SHUTDOWN_DELAY_S)))
+    if shutdown_delay_s < 5:
+        shutdown_delay_s = 5
 
     wittypi_dir_raw = power.get("wittypi_dir")
     wittypi_dir = Path(str(wittypi_dir_raw)) if wittypi_dir_raw else find_wittypi_dir(config)
 
-    if dry_run:
-        append_log(log_file, "POWER: terminal shutdown dry-run; GPIO-4 will not be triggered.")
-        result = run_power_wrapper(
-            action="shutdown",
-            target_epoch=None,
-            wittypi_dir=wittypi_dir,
-            dry_run=True,
-            log_file=log_file,
-        )
-        power["shutdown_result"] = result
-        power["shutdown_requested"] = bool(result.get("ok"))
-        if not power["shutdown_requested"]:
-            power["shutdown_skipped_reason"] = "shutdown_wrapper_failed"
-        return power["shutdown_requested"]
+    # Calculate the near-future Alarm 2 target only now, after all normal Poracam
+    # writes are complete. This avoids consuming the shutdown margin during media
+    # conversion/status handling.
+    shutdown_epoch = int(time.time()) + shutdown_delay_s
+    shutdown_time = epoch_to_local_iso(shutdown_epoch)
+    power["shutdown_alarm_epoch"] = shutdown_epoch
+    power["shutdown_alarm_time"] = shutdown_time
+    power["shutdown_delay_s"] = shutdown_delay_s
 
-    script = find_power_script()
-    if script is None:
-        power["shutdown_skipped_reason"] = "shutdown_wrapper_missing"
-        append_log(log_file, f"POWER ERROR: {WITTYPI_POWER_SCRIPT_NAME} not found; terminal shutdown skipped.")
-        return False
-
-    if wittypi_dir is None:
-        power["shutdown_skipped_reason"] = "wittypi_dir_missing"
-        append_log(log_file, "POWER ERROR: Witty Pi directory not found; terminal shutdown skipped.")
-        return False
-
-    # Everything that needs persistence must be written BEFORE this point.
     append_log(
         log_file,
-        "POWER: all Poracam writes finalized; performing final filesystem sync before terminal shutdown.",
+        f"POWER: all Poracam writes finalized; arming Witty Pi Alarm 2 for {shutdown_time} "
+        f"(+{shutdown_delay_s}s).",
     )
-    if shutdown_delay_s > 0:
+
+    result = run_power_wrapper(
+        action="schedule-shutdown",
+        target_epoch=shutdown_epoch,
+        wittypi_dir=wittypi_dir,
+        dry_run=dry_run,
+        log_file=log_file,
+    )
+    power["shutdown_result"] = result
+    power["shutdown_requested"] = bool(result.get("ok"))
+
+    if not power["shutdown_requested"]:
+        power["shutdown_skipped_reason"] = "shutdown_alarm2_schedule_failed"
         append_log(
             log_file,
-            f"POWER: terminal shutdown armed; GPIO-4 will be triggered after {shutdown_delay_s}s with no further Poracam writes.",
+            "POWER ERROR: Witty Pi Alarm 2 could not be armed; system will remain powered. "
+            "Legacy GPIO-4 fallback is intentionally disabled in v0.8.3.5.",
+        )
+    elif dry_run:
+        append_log(log_file, "POWER: Alarm 2 dry-run completed; no real shutdown alarm was written.")
+    else:
+        append_log(
+            log_file,
+            f"POWER: Witty Pi Alarm 2 armed for {shutdown_time}; Poracam will exit and the MCU will initiate shutdown.",
         )
 
-    # Final filesystem flush. Do not log anything after a successful os.sync().
+    # Final filesystem flush after recording the Alarm 2 result. Do not append
+    # additional Poracam log entries after this sync on a successful real arm.
     try:
         os.sync()
     except AttributeError:
-        # Python/Linux normally provides os.sync(). Fallback is intentionally
-        # silent because writing a post-sync log would dirty the filesystem again.
         subprocess.run(["sync"], check=False)
     except Exception:
-        # Same principle: keep the shutdown path terminal and avoid new disk I/O.
         subprocess.run(["sync"], check=False)
 
-    if shutdown_delay_s > 0:
-        time.sleep(shutdown_delay_s)
-
-    argv = [str(script), "shutdown", "--wittypi-dir", str(wittypi_dir)]
-
-    try:
-        # Successful exec never returns. The wrapper becomes the current process.
-        os.execv(str(script), argv)
-    except Exception as exc:
-        # Safe to log here: exec failed, so GPIO-4 was not triggered by this call.
-        power["shutdown_skipped_reason"] = "terminal_exec_failed"
-        power["shutdown_result"] = {
-            "ok": False,
-            "error": str(exc),
-            "script": str(script),
-            "wittypi_dir": str(wittypi_dir),
-        }
-        append_log(log_file, f"POWER ERROR: terminal shutdown exec failed before GPIO-4 trigger: {exc}")
-        return False
+    return power["shutdown_requested"]
 
 def record(config: Dict[str, Any], config_source: Optional[str], config_source_type: str, external_storage_used: bool, config_warnings: List[str]) -> int:
     validate_config(config)
@@ -3131,9 +3123,9 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
         )
 
         if bool(power_info.get("shutdown_pending", False)):
-            # TERMINAL ACTION: on success this replaces the Python process and
-            # never returns. Nothing in Poracam executes after the GPIO-4 trigger.
-            execute_terminal_shutdown(config, power_info, log_file)
+            # v0.8.3.5: arm Witty Pi Alarm 2 only after all normal Poracam writes.
+            # The MCU will originate the shutdown event; Raspberry GPIO-4 is not driven.
+            arm_wittypi_scheduled_shutdown(config, power_info, log_file)
         else:
             # No shutdown will occur (disabled, field-check failure, schedule
             # failure, etc.), so a conventional logged sync is safe here.
@@ -3146,7 +3138,7 @@ def record(config: Dict[str, Any], config_source: Optional[str], config_source_t
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Poracam v0.8.3.4: USB boot robustness, direct ALSA hardware capture and terminal Witty Pi shutdown."
+        description="Poracam v0.8.3.5: Witty Pi Alarm-2 shutdown, USB recovery and direct ALSA hardware capture."
     )
 
     parser.add_argument(

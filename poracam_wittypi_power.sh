@@ -1,17 +1,18 @@
 #!/bin/bash
 # file: poracam_wittypi_power.sh
 #
-# Poracam v0.8.3.4 - Witty Pi integration with terminal shutdown trigger.
+# Poracam v0.8.3.5 - Witty Pi Alarm 1/Alarm 2 integration.
 #
 # Actions:
-#   schedule-startup --target-epoch <epoch>
-#   shutdown
+#   schedule-startup  --target-epoch <epoch>   # Alarm 1
+#   schedule-shutdown --target-epoch <epoch>   # Alarm 2 (v0.8.3.5 production path)
+#   shutdown                                  # legacy/manual GPIO-4 action
 #
-# Shutdown behavior:
-#   - never calls do_shutdown() directly;
-#   - asks Witty Pi daemon.sh to shutdown through GPIO-4;
-#   - the GPIO-4 write is the terminal command of this wrapper (exec), so the
-#     wrapper performs no sleep/echo/file activity after the falling edge.
+# v0.8.3.5 production shutdown behavior:
+#   - Poracam programs Alarm 2 through set_shutdown_time();
+#   - the Witty Pi MCU originates the shutdown event when Alarm 2 expires;
+#   - daemon.sh identifies REASON_ALARM2 and runs beforeShutdown.sh/do_shutdown();
+#   - the legacy `shutdown` action is retained only for manual/backward compatibility.
 
 set -o pipefail
 
@@ -44,7 +45,7 @@ while [ $# -gt 0 ]; do
 done
 
 if [ -z "$ACTION" ]; then
-    echo "Missing action: schedule-startup or shutdown" >&2
+    echo "Missing action: schedule-startup, schedule-shutdown or shutdown" >&2
     exit 2
 fi
 
@@ -103,6 +104,34 @@ case "$ACTION" in
 
         echo "Scheduled next startup at $HUMAN"
         echo "Witty Pi startup register: $(get_startup_time)"
+        ;;
+
+    schedule-shutdown)
+        if [ -z "$TARGET_EPOCH" ]; then
+            echo "schedule-shutdown requires --target-epoch" >&2
+            exit 2
+        fi
+        if ! [[ "$TARGET_EPOCH" =~ ^[0-9]+$ ]]; then
+            echo "Invalid target epoch: $TARGET_EPOCH" >&2
+            exit 2
+        fi
+
+        DATE="$(date -d "@$TARGET_EPOCH" +"%d")"
+        HOUR="$(date -d "@$TARGET_EPOCH" +"%H")"
+        MINUTE="$(date -d "@$TARGET_EPOCH" +"%M")"
+        SECOND="$(date -d "@$TARGET_EPOCH" +"%S")"
+        HUMAN="$(date -d "@$TARGET_EPOCH" +"%Y-%m-%d %H:%M:%S %Z")"
+
+        RES="$(check_sys_and_rtc_time || true)"
+        if [ -n "$RES" ]; then
+            echo "$RES" >&2
+        fi
+
+        clear_shutdown_time
+        set_shutdown_time "$DATE" "$HOUR" "$MINUTE" "$SECOND"
+
+        echo "Scheduled shutdown via Witty Pi Alarm 2 at $HUMAN"
+        echo "Witty Pi shutdown register: $(get_shutdown_time)"
         ;;
 
     shutdown)
